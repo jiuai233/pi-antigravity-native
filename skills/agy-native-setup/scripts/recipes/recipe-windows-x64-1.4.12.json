@@ -1,0 +1,30 @@
+{
+  "id": "patch.antigravity-context-window",
+  "version": "1.0.3",
+  "platform": "windows-x64",
+  "description": "agy 1.4.12 Windows: Store.ContextWindow tail-jumps to Store.ContextWindowChoice so the saved contextWindow preset becomes the native budget",
+  "targets": [
+    {
+      "kind": "native-executable",
+      "package": "agy",
+      "version": "1.4.12",
+      "files": {
+        "agy.exe": {
+          "base": "b4bbcc9f65d355bc84523d4f43e1ead34992890baf60c24e4ccbf605e2da6858",
+          "result": "c87dbdd56b31c2c442bdb48d66f3d73ed63fb8b90c33946a3236d6efaf27cec0"
+        }
+      },
+      "byte_replacements": [
+        {
+          "offset": 53437568,
+          "before": "4c8d642480",
+          "after": "e9bbffffff"
+        }
+      ],
+      "functions": {
+        "store.(*Store).ContextWindow": { "address": "0x1432f6e80", "file_offset": 53437568 },
+        "store.(*Store).ContextWindowChoice": { "address": "0x1432f6e40", "file_offset": 53437504 }
+      }
+    }
+  ]
+}

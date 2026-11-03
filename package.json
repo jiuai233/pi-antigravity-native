@@ -1,0 +1,94 @@
+{
+  "name": "@jiuai233/pi-antigravity-native",
+  "version": "1.2.0",
+  "type": "module",
+  "description": "Antigravity native provider for Pi with public thinking, tool bridging and macOS 512K support",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "antigravity",
+    "agy",
+    "gemini"
+  ],
+  "author": {
+    "name": "Tian Zuo",
+    "url": "https://github.com/TianZuo555"
+  },
+  "contributors": [
+    {
+      "name": "jiuai233",
+      "url": "https://github.com/jiuai233"
+    }
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jiuai233/pi-antigravity-native.git"
+  },
+  "homepage": "https://github.com/jiuai233/pi-antigravity-native#readme",
+  "bugs": {
+    "url": "https://github.com/jiuai233/pi-antigravity-native/issues"
+  },
+  "files": [
+    "plugin/index.ts",
+    "plugin/src/",
+    "plugin/execution-surface.json",
+    "skills/",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": "^24.15.0 || >=26.0.0"
+  },
+  "pi": {
+    "executionSurface": "./plugin/execution-surface.json",
+    "extensions": [
+      "./plugin/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "test": "node --test plugin/test/*.test.mjs",
+    "typecheck": "tsc -p plugin/tsconfig.json"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.16.0",
+    "semver": "^7.8.5",
+    "which": "^7.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=1.4.0",
+    "@earendil-works/pi-coding-agent": ">=1.4.0",
+    "@earendil-works/pi-tui": ">=1.4.0",
+    "typebox": "^1.3.27"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
+    "typebox": "1.3.27",
+    "@types/node": "25.5.0",
+    "@types/semver": "^7.7.1",
+    "@types/which": "^3.0.4",
+    "typescript": "5.9.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

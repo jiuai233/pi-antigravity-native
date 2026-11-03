@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "kind": "agy_native_bridge",
+  "tool_transport": "AGY call_mcp_tool to the Pi active-tool bridge",
+  "bridge_tools": ["call_mcp_tool"],
+  "native_tools": ["view_file", "generate_image"],
+  "pi_tool_control": "Pi active registry and execution hooks",
+  "native_tool_control": "AGY custom-agent frontmatter, outside Pi tool-call hooks",
+  "native_skill_reader": "view_file",
+  "declaration_status": "declared_not_runtime_observed",
+  "profile_source": "runner PI_WORKER_TASK_PACKAGE_PATH plus SUBAGENT_PROJECT_ROOT; package_id and agent.role; extensions.review_execution.profile",
+  "profiles": {
+    "default": {
+      "id": "default"
+    },
+    "evidence_only_v1": {
+      "id": "evidence_only_v1",
+      "native_tools": [],
+      "bridge_tool_allowlist": ["submit_task_result", "submit_review_result"],
+      "schema_delivery": "inline_actual_bridge_parameters",
+      "native_skill_reader": null
+    }
+  },
+  "instruction_modes": ["custom_agent"],
+  "instructions": "Pi 工具经桥接执行；默认 view_file 和 generate_image 由 AGY 原生执行。明确 worker 任务包的 evidence_only_v1 profile 关闭原生业务工具，仅保留实际提交桥及内联 schema。此处是配置声明，不是运行时观测；Pi 工具白名单不推导闭卷，也不是文件或网络沙箱。"
+}
