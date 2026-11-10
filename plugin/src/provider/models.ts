@@ -160,7 +160,7 @@ const ZERO_PRICING: ModelPricing = {
  * than inheriting an unrelated vendor's rate.
  */
 export function pricingForModel(modelId: string, asOf = Date.now()): ModelPricing {
-  if (/^gemini-4-argon$/i.test(modelId)) {
+  if (/^gemini-4-(?:argon|carbon)$/i.test(modelId)) {
     // Gemini API introductory reference rates expire after November 30, 2026.
     // https://ai.google.dev/gemini-api/docs/pricing
     const multiplier = asOf < Date.UTC(2026, 11, 1) ? 1 : 2;
