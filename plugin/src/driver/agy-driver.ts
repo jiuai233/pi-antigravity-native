@@ -8,6 +8,8 @@ import {
   AgyStallError,
   type AgyTurnRequest,
   buildDriverAgyArgs,
+  notifyAgyDiagnostic,
+  notifyAgyTiming,
   runAgyTurn,
 } from "./agy-client.ts";
 import { AgyCompatibilityError, checkAgyBinary } from "./agy-diagnostics.ts";
@@ -43,6 +45,7 @@ export interface AgyProcessConfigSnapshot {
   model?: string;
   effort?: string;
   agent?: string;
+  agentRevision?: string;
   mode?: string;
   bridgeRevision?: string;
 }
@@ -80,6 +83,9 @@ interface ActiveTurn {
   nativeBoundary: ReturnType<typeof captureNativeTurnBoundary>;
   activeTools: Set<string>;
   conversationReported: boolean;
+  firstStdoutAtMs?: number;
+  firstActivityAtMs?: number;
+  firstResponseTextAtMs?: number;
   watchdogStartedAtMs?: number;
   lastStdoutAtMs?: number;
   lastStderrAtMs?: number;
@@ -121,6 +127,7 @@ function processConfig(
     model: request.model,
     effort: request.effort,
     agent: request.agent,
+    ...(request.agentRevision !== undefined ? { agentRevision: request.agentRevision } : {}),
     mode: request.mode,
     bridgeRevision: request.bridgeRevision,
   };
@@ -143,7 +150,7 @@ function recycleCause(
   if (current.mcpDirectory !== next.mcpDirectory) return "mcp-directory";
   if (current.model !== next.model) return "model";
   if (current.effort !== next.effort) return "effort";
-  if (current.agent !== next.agent) return "agent";
+  if (current.agent !== next.agent || current.agentRevision !== next.agentRevision) return "agent";
   if (current.mode !== next.mode) return "mode";
   if (current.bridgeRevision !== next.bridgeRevision) return "bridge-catalog";
   if (request.conversationId === undefined) {
@@ -210,6 +217,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
   }
 
   async run(request: AgyTurnRequest): Promise<AgyTurnOutcome> {
+    notifyAgyTiming(request, "local_run_start", "persistent");
     let release!: () => void;
     const previous = this.#queueTail;
     this.#queueTail = new Promise<void>((resolve) => {
@@ -267,8 +275,10 @@ export class AgyDriverSession implements AgyTurnExecutor {
     const nextConfig = processConfig(request, binary, checked?.version, checked?.revision);
     if (this.#child) {
       const cause = recycleCause(request, this.#config, nextConfig, this.#boundConversationId);
-      if (cause) await this.close("recycle", cause);
-      else this.#reusedTurns += 1;
+      if (cause) {
+        notifyAgyDiagnostic(request.onDiagnostic, { phase: "driver_recycle", atMs: Date.now(), conversationId: request.conversationId, message: cause });
+        await this.close("recycle", cause);
+      } else this.#reusedTurns += 1;
     }
     if (request.signal?.aborted) return abortOutcome();
     if (this.#shutdown) throw new AgySpawnError("agy driver is shut down.", this.#stderrTail);
@@ -281,6 +291,11 @@ export class AgyDriverSession implements AgyTurnExecutor {
     if (!child) throw new AgySpawnError("agy driver failed to start.", this.#stderrTail);
 
     const turn = this.#createTurn(request);
+    // The parent has attached the child streams and completed local preparation.
+    // This does not assert that AGY initialized or sent a network request.
+    notifyAgyTiming(request, "stdin_ready", "persistent", {
+      processGeneration: turn.generation, reusedProcess: this.#currentProcessTurns > 0,
+    });
     const outcomePromise = new Promise<AgyTurnOutcome>((resolve, reject) => {
       turn.resolve = resolve;
       turn.reject = reject;
@@ -292,7 +307,11 @@ export class AgyDriverSession implements AgyTurnExecutor {
     this.#armTurnTimers(turn);
     if (this.#active !== turn) return outcomePromise;
     try {
+      notifyAgyTiming(request, "stdin_write_start", "persistent", { processGeneration: turn.generation });
       await this.#writeUserEvent(child, request.prompt);
+      // Both the local write callback and any backpressure drain have finished.
+      // It is not an acknowledgement from AGY or the model service.
+      notifyAgyTiming(request, "stdin_write_complete", "persistent", { processGeneration: turn.generation });
     } catch (error) {
       this.#detachChild(child, "dead");
       killAgyTree(child, this.#deps.childrenHost);
@@ -316,7 +335,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
     this.#config = config;
     if (request.conversationId && !request.spawnOverride) {
       const upgrade = (this.#deps.upgradeNativeConversationDb ?? upgradeNativeConversationDb)(
-        request.conversationId, request.cwd, request.nativeTools,
+        request.conversationId, request.cwd, request.nativeTools, request.agentBody,
       );
       if (upgrade.status === "failed") {
         if (request.nativeTools?.length === 0) {
@@ -324,6 +343,10 @@ export class AgyDriverSession implements AgyTurnExecutor {
           this.#config = undefined;
           this.#boundConversationId = undefined;
           throw new AgySpawnError(upgrade.message, "");
+        }
+        if (this.#config?.agentRevision !== undefined) {
+          const { agentRevision: _retryNextTurn, ...rest } = this.#config;
+          this.#config = rest;
         }
         if (request.onActivity) request.onActivity({ type: "native_migration_warning", message: upgrade.message });
         else console.warn(upgrade.message);
@@ -454,8 +477,8 @@ export class AgyDriverSession implements AgyTurnExecutor {
   }
 
   #armTurnTimers(turn: ActiveTurn): void {
-    const overallMs = turn.request.timeoutMs ?? 600_000;
-    turn.overallTimer = turn.request.budget ? undefined : setTimeout(() => {
+    const overallMs = turn.request.timeoutMs ?? 0;
+    turn.overallTimer = turn.request.budget || overallMs === 0 ? undefined : setTimeout(() => {
       const child = this.#child;
       if (this.#active !== turn || !child) return;
       this.#detachChild(child, "dead");
@@ -493,9 +516,9 @@ export class AgyDriverSession implements AgyTurnExecutor {
     if (this.#active !== turn) return;
     if (turn.stallTimer) clearTimeout(turn.stallTimer);
     if (turn.request.budget?.paused) return;
-    const baseMs = turn.request.inactivityTimeoutMs ?? 120_000;
+    const baseMs = turn.request.inactivityTimeoutMs ?? 300_000;
     if (baseMs <= 0) return;
-    const toolMs = turn.request.toolInactivityTimeoutMs ?? Math.max(baseMs, 300_000);
+    const toolMs = turn.request.toolInactivityTimeoutMs ?? Math.max(baseMs, 600_000);
     const budgetMs = turn.activeTools.size > 0 ? toolMs : baseMs;
     // Each rearm clears the previous timer, so this start time is the one the
     // timer below reports.
@@ -504,7 +527,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
     turn.stallTimer = setTimeout(() => {
       const child = this.#child;
       if (this.#active !== turn || !child) return;
-      turn.request.onDiagnostic?.({ phase: "stall", atMs: Date.now(),
+      notifyAgyDiagnostic(turn.request.onDiagnostic, { phase: "stall", atMs: Date.now(),
         conversationId: turn.outcome.conversationId ?? turn.request.conversationId,
         lastToolCompletedAtMs: turn.request.budget?.lastToolCompletedAtMs ?? turn.lastToolCompletedAtMs,
         watchdogStartedAtMs,
@@ -521,6 +544,13 @@ export class AgyDriverSession implements AgyTurnExecutor {
   #onStdout(generation: number, chunk: string): void {
     if (generation !== this.#generation) return;
     if (this.#active) {
+      if (this.#active.firstStdoutAtMs === undefined && chunk.length > 0) {
+        this.#active.firstStdoutAtMs = Date.now();
+        notifyAgyTiming(this.#active.request, "stdout_first_byte", "persistent", {
+          conversationId: this.#active.outcome.conversationId ?? this.#active.request.conversationId,
+          processGeneration: this.#active.generation,
+        });
+      }
       this.#active.lastStdoutAtMs = Date.now();
       this.#rearmStall(this.#active);
     }
@@ -571,11 +601,16 @@ export class AgyDriverSession implements AgyTurnExecutor {
       const reconciled = (this.#deps.reconcileNativeTerminal ?? reconcileNativeTerminal)(
         parsed.result, turn.nativeBoundary, turn.request.cwd,
       );
-      if (reconciled.correction) turn.request.onDiagnostic?.({
-        phase: "historical_terminal_error", atMs: Date.now(),
-        conversationId: parsed.result.conversation_id,
-        status: "SUCCESS", message: JSON.stringify(reconciled.correction),
-      });
+      if (reconciled.correction) {
+        notifyAgyDiagnostic(turn.request.onDiagnostic, {
+          phase: reconciled.correction.kind ?? "historical_terminal_error", atMs: Date.now(),
+          conversationId: parsed.result.conversation_id,
+          status: "SUCCESS", message: JSON.stringify(reconciled.correction),
+        });
+        if (reconciled.correction.kind === "healed_in_turn_error" && reconciled.correction.in_turn_error_count) {
+          turn.request.onActivity?.({ type: "healed_in_turn_error", count: reconciled.correction.in_turn_error_count });
+        }
+      }
       parsed = { ...parsed, result: reconciled.result };
     }
     if (!turn.conversationReported) {
@@ -594,6 +629,17 @@ export class AgyDriverSession implements AgyTurnExecutor {
       }
     }
     for (const activity of applyEvent(turn.outcome, parsed)) {
+      const timing = { conversationId: turn.outcome.conversationId ?? turn.request.conversationId,
+        processGeneration: turn.generation, activityType: activity.type };
+      if (turn.firstActivityAtMs === undefined) {
+        turn.firstActivityAtMs = Date.now();
+        notifyAgyTiming(turn.request, "activity_first", "persistent", timing);
+      }
+      if (turn.firstResponseTextAtMs === undefined && ((activity.type === "text" && activity.delta.length > 0)
+        || (activity.type === "result" && activity.response.length > 0))) {
+        turn.firstResponseTextAtMs = Date.now();
+        notifyAgyTiming(turn.request, "response_text_first", "persistent", timing);
+      }
       if (activity.type === "tool_done" || activity.type === "tool_error") turn.lastToolCompletedAtMs = Date.now();
       trackActiveToolStep(turn.activeTools, activity);
       turn.request.onActivity?.(activity);
@@ -662,6 +708,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
     if (child && !("error" in result) && turn.activeTools.size > 0) {
       this.#log(`recycle:background-task:${turn.activeTools.size}`);
       this.#recordRecycle("background-task");
+      notifyAgyDiagnostic(turn.request.onDiagnostic, { phase: "driver_recycle", atMs: Date.now(), conversationId: this.#boundConversationId, message: "background-task" });
       this.#recycling = this.#recycleIncompleteChild(child, turn.request.childOwner);
       void this.#recycling.then(() => turn.resolve(result.outcome), turn.reject);
       return;

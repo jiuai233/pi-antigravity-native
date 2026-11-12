@@ -115,6 +115,103 @@ function applyNativeToolFilters(spec: Buffer, nativeTools: readonly string[]): B
   return Buffer.concat(chunks);
 }
 
+export interface AgentPromptSection {
+  title: string;
+  content: string;
+}
+
+function stripYamlFrontmatter(markdown: string): string {
+  const frontmatter = /^---(?:\r\n|\r|\n)[\s\S]*?^---(?:\r\n|\r|\n)/m.exec(markdown);
+  return frontmatter?.index === 0 ? markdown.slice(frontmatter[0].length) : markdown;
+}
+
+/**
+ * Split custom-agent Markdown into the exact PromptSection records agy stores
+ * in AgentConfig.field_2: initial title "System Prompt" before the first H1,
+ * top-level `# Heading` boundaries outside fenced code blocks, trimmed bodies,
+ * empty sections omitted.
+ */
+export function parseAgentPromptSections(markdown: string): AgentPromptSection[] {
+  const source = stripYamlFrontmatter(markdown);
+  const sections: AgentPromptSection[] = [];
+  let title = "System Prompt";
+  let lines: string[] = [];
+  let fenceChar: "`" | "~" | undefined;
+  let fenceLen = 0;
+
+  const flush = () => {
+    const content = lines.join("").trim();
+    if (content) sections.push({ title, content });
+    lines = [];
+  };
+
+  // Inspect line text for Markdown structure, but retain the original prompt bytes.
+  for (const rawLine of source.match(/[^\r\n]*(?:\r\n|\r|\n|$)/g) ?? []) {
+    const line = rawLine.replace(/(?:\r\n|\r|\n)$/, "");
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1];
+      const ch = marker[0] as "`" | "~";
+      const rest = fenceMatch[2];
+      if (!fenceChar) {
+        if (ch === "~" || !rest.includes("`")) {
+          fenceChar = ch;
+          fenceLen = marker.length;
+        }
+      } else if (ch === fenceChar && marker.length >= fenceLen && /^\s*$/.test(rest)) {
+        fenceChar = undefined;
+        fenceLen = 0;
+      }
+      lines.push(rawLine);
+      continue;
+    }
+    if (!fenceChar) {
+      const heading = line.match(/^#\s+(.+?)\s*$/);
+      if (heading) {
+        flush();
+        title = heading[1];
+        continue;
+      }
+    }
+    lines.push(rawLine);
+  }
+  flush();
+  return sections;
+}
+
+function encodeLengthDelimited(fieldNumber: number, payload: Buffer): Buffer {
+  return Buffer.concat([encodeVarint((fieldNumber << 3) | 2), encodeVarint(payload.length), payload]);
+}
+
+function encodePromptSectionEntry(title: string, content: string): Buffer {
+  const parts: Buffer[] = [];
+  if (title.length > 0) parts.push(encodeLengthDelimited(1, Buffer.from(title, "utf8")));
+  if (content.length > 0) parts.push(encodeLengthDelimited(2, Buffer.from(content, "utf8")));
+  const section = Buffer.concat(parts);
+  const wrapper = encodeLengthDelimited(1, section);
+  return encodeLengthDelimited(2, wrapper);
+}
+
+/** Replace AgentConfig.field_2 PromptSection wrappers while preserving all other fields. */
+export function applyAgentPromptSections(
+  spec: Buffer,
+  sections: readonly AgentPromptSection[],
+): Buffer {
+  if (sections.length === 0) return spec;
+  const reader = new BinaryReader(spec);
+  const before: Buffer[] = [];
+  const after: Buffer[] = [];
+  while (reader.pos < reader.len) {
+    const start = reader.pos;
+    const [field, wire] = reader.tag();
+    reader.skip(wire, field);
+    if (field === 2 && wire === WireType.LengthDelimited) continue;
+    (field < 2 ? before : after).push(spec.subarray(start, reader.pos));
+  }
+  const encoded = sections.map(({ title, content }) => encodePromptSectionEntry(title, content));
+  return Buffer.concat([...before, ...encoded, ...after]);
+}
+
 function upgradeCheckpoint512k(ckpt: Buffer): Buffer {
   const idx = ckpt.indexOf(CHECKPOINT_256K);
   if (idx === -1) return ckpt;
@@ -206,12 +303,23 @@ export type NativeConversationUpgradeResult =
   | { status: "failed"; message: string };
 
 /**
- * Align persisted CustomAgentSpec native filters with the effective profile and
- * upgrade 256K->512K checkpoints before spawning `agy --conversation <id>`.
+ * Align persisted CustomAgentSpec PromptSections + native ToolFilters with the
+ * active agent snapshot and upgrade 256K->512K checkpoints before spawning
+ * `agy --conversation <id>`.
  */
-export function upgradeNativeConversationDb(conversationId: string, cwd = process.cwd(),
-  nativeTools: readonly string[] = DEFAULT_NATIVE_TOOLS): NativeConversationUpgradeResult {
-  const alignFilters = (spec: Buffer) => applyNativeToolFilters(spec, nativeTools);
+export function upgradeNativeConversationDb(
+  conversationId: string,
+  cwd = process.cwd(),
+  nativeTools: readonly string[] = DEFAULT_NATIVE_TOOLS,
+  agentBody?: string,
+): NativeConversationUpgradeResult {
+  let specVisited = 0;
+  const sections = agentBody?.trim() ? parseAgentPromptSections(agentBody) : undefined;
+  const alignFilters = (spec: Buffer) => {
+    specVisited += 1;
+    const withTools = applyNativeToolFilters(spec, nativeTools);
+    return sections?.length ? applyAgentPromptSections(withTools, sections) : withTools;
+  };
   const file = path.join(resolveAgyDataDirectory(cwd), "conversations", `${conversationId}.db`);
   let database: DatabaseSync | undefined;
   let transactionStarted = false;
@@ -263,6 +371,9 @@ export function upgradeNativeConversationDb(conversationId: string, cwd = proces
         modified = true;
       }
     }
+    if (specVisited === 0) {
+      throw new Error("no CustomAgentSpec record found in persisted conversation metadata");
+    }
     database.exec("COMMIT");
     transactionStarted = false;
     return { status: modified ? "migrated" : "unchanged" };
@@ -279,7 +390,7 @@ export function upgradeNativeConversationDb(conversationId: string, cwd = proces
       message: `antigravity：原生会话 ${conversationId} 的旧数据升级失败（${detail}）。` +
         (nativeTools.length === 0
           ? "闭卷原生过滤未确认，本轮不启动此会话；处理上述错误后重载重试。"
-          : "本轮继续使用既有会话，原生工具与 512K 升级未确认；处理上述错误后重载此会话重试。"),
+          : "本轮继续使用既有会话，提示词、原生工具与 512K 升级未确认；下一轮将自动重试，若持续失败请处理上述错误后重载。"),
     };
   } finally {
     try {

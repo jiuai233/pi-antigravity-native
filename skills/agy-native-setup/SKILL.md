@@ -5,7 +5,7 @@ description: 安装 Pi Antigravity Native，核对 AGY 二进制、原生窗口�
 
 # 安装 Pi Antigravity Native
 
-插件版本 1.2.0。仓库根目录包含 `package.json`、`plugin/` 和本技能目录。
+插件版本 1.3.0。仓库根目录包含 `package.json`、`plugin/` 和本技能目录。
 
 ## 1. 核对环境
 
@@ -20,7 +20,9 @@ description: 安装 Pi Antigravity Native，核对 AGY 二进制、原生窗口�
 
 ### macOS
 
-未显式设置 `AGY_BINARY`，且 `~/.gemini/bin/agy-512k` 存在时，插件自动使用该副本，并默认设置 `AGY_CLI_DISABLE_AUTO_UPDATE=true`。既有环境变量保留。插件不修改二进制。
+未显式设置 `AGY_BINARY` 时，插件按顺序选择已安装的 `~/.gemini/bin/agy-512k-keepalive`、`~/.gemini/bin/agy-512k`，并默认设置 `AGY_CLI_DISABLE_AUTO_UPDATE=true`。既有环境变量优先。插件不修改二进制。
+
+可选保活副本通过 `python3 -I skills/agy-native-setup/scripts/agy_keepalive_patch.py apply` 创建。脚本只接受已核验的 1.4.12 arm64 512K 构建，保留原文件，并对新副本做本地签名。每 270 秒最多 6 次真实模型请求，会消耗账号用量；机制和停用方式见 [保活说明](references/keepalive-patch.md)。
 
 macOS arm64 的 AGY 1.4.12 补丁副本已有本地 512K 验证。其它构建不能复用未核对的字节偏移。原生窗口读取方法见下文，补丁机制见 [窗口说明](references/window-patch.md)。
 
@@ -43,7 +45,7 @@ python -I skills/agy-native-setup/scripts/agy_window_patch.py status
 GitHub 安装：
 
 ```sh
-pi install git:github.com/jiuai233/pi-antigravity-native
+pi install git:github.com/jiuai233/pi-antigravity-native@v1.3.0
 ```
 
 本地源码安装在仓库根目录执行：
@@ -57,7 +59,7 @@ Pi 本地路径安装引用源码目录，需长期保留。完整开发依赖�
 
 ## 4. 核验
 
-1. `/agy doctor` 核对实际二进制；Mac 512K 路线应指向 `agy-512k`。
+1. `/agy doctor` 核对实际二进制；Mac 512K 路线应指向 `agy-512k` 或 `agy-512k-keepalive`。
 2. 使用真实模型完成一轮普通对话。该操作会使用已登录 AGY 账号的模型额度。
 3. 在仓库根目录运行：
 
@@ -74,4 +76,5 @@ Pi 本地路径安装引用源码目录，需长期保留。完整开发依赖�
 - [修改与开发](references/modifications.md)
 - [故障定位](references/pitfalls.md)
 - [窗口补丁](references/window-patch.md)
+- [缓存保活](references/keepalive-patch.md)
 - [公开思路](references/public-thinking.md)

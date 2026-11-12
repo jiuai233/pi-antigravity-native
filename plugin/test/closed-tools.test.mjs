@@ -89,7 +89,7 @@ test('native contract fingerprint survives real persisted state parsing and bran
 });
 
 test('same native contract resumes; profile or actual Pi schema changes start a fresh native conversation', async () => {
-  const f = fixture({ clock: false });
+  const f = fixture();
   const requests = [];
   const rt = createAntigravityRuntime(async request => {
     requests.push(request); request.onConversation(`native-${requests.length}`);

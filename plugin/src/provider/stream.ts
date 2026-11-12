@@ -32,7 +32,12 @@ import {
   type BridgeContent,
   resolveBridgeResultsFromContext,
 } from "../extension/bridge.ts";
-import { fitNativeRequest, latestUserPrompt, piHistoryBootstrap } from "../input/pi-input.ts";
+import {
+  fitNativeRequest,
+  latestUserPrompt,
+  piHistoryBootstrap,
+  piHistoryBootstrapChunks,
+} from "../input/pi-input.ts";
 import { steerNoticePrompt } from "../input/prompt.ts";
 import { readNativeToolResult } from "../native/native-results.ts";
 import { type AntigravityRuntime, createAntigravityRuntime, type StreamTurnRequest } from "../runtime/runtime.ts";
@@ -61,6 +66,7 @@ type ResultActivity = Extract<AgyActivity, { type: "result" }>;
 const defaultDependencies = {
   latestUserPrompt,
   piHistoryBootstrap,
+  piHistoryBootstrapChunks,
   fitNativeRequest,
   normalizeContext,
   getCurrentSystemPrompt,
@@ -100,12 +106,13 @@ export interface StreamAntigravityOptions {
   getBridgeRevision?: () => string | undefined;
   /** Write the active Pi system snapshot and return its custom-agent name. */
   prepareAgent?: (systemPrompt: string, declaredTools: readonly Tool[]) => Promise<string | {
-    name: string; nativeContractHash: string; nativeTools: string[];
+    name: string; nativeContractHash: string; nativeTools: string[]; agentBody?: string;
   }>;
 }
 
 interface TurnDeps {
   dependencies: ProviderDependencies;
+  customHistoryBootstrapOnly: boolean;
   runtime: AntigravityRuntime;
   replay: AgyReplayStore;
   bridge: AgyPiBridge;
@@ -136,6 +143,9 @@ export function streamAntigravity({
 }: StreamAntigravityOptions) {
   const deps: TurnDeps = {
     dependencies: { ...defaultDependencies, ...dependencies },
+    customHistoryBootstrapOnly: Boolean(
+      dependencies?.piHistoryBootstrap && !dependencies?.piHistoryBootstrapChunks,
+    ),
     runtime, replay, bridge, onSettled, isActiveTool, onActivity,
     createIsolatedRuntime, getModelInfo, getProcessProfile, getBridgeRevision, prepareAgent,
   };
@@ -252,8 +262,18 @@ class ProviderTurn {
       bridgeRevision = deps.getBridgeRevision();
       processProfile = deps.getProcessProfile();
     }
+    const modelInfo = deps.getModelInfo(this.#model.id);
     const requestedEffort = mapThinkingToEffort(this.#options?.reasoning);
-    const effort = deps.dependencies.resolveAgyModelEffort(deps.getModelInfo(this.#model.id), requestedEffort);
+    const effort = deps.dependencies.resolveAgyModelEffort(modelInfo, requestedEffort);
+    const historyPlan = this.#summaryRequest
+      ? { prefill: [] as string[], bootstrap: undefined }
+      : deps.customHistoryBootstrapOnly
+        ? { prefill: [] as string[], bootstrap: this.#deps.dependencies.piHistoryBootstrap(this.#context) }
+        : this.#deps.dependencies.piHistoryBootstrapChunks(this.#context);
+    const prefillEffort =
+      historyPlan.prefill.length > 0
+        ? (deps.dependencies.resolveAgyModelEffort(modelInfo, "low") ?? effort)
+        : undefined;
 
     const request: StreamTurnRequest = {
       prompt,
@@ -261,8 +281,12 @@ class ProviderTurn {
       ...(typeof preparedAgent === "object" ? {
         nativeContractHash: preparedAgent.nativeContractHash,
         nativeTools: preparedAgent.nativeTools,
+        ...(preparedAgent.agentBody !== undefined ? { agentBody: preparedAgent.agentBody } : {}),
       } : {}),
-      historyBootstrap: this.#summaryRequest ? undefined : this.#deps.dependencies.piHistoryBootstrap(this.#context),
+      ...(historyPlan.prefill.length > 0
+        ? { historyPrefill: historyPlan.prefill, prefillEffort }
+        : {}),
+      historyBootstrap: historyPlan.bootstrap,
       modelId: this.#model.id,
       effort,
       agent: nativeAgent ?? processProfile.agent,
@@ -410,6 +434,7 @@ class ProviderTurn {
       case "native_migration_warning":
         writer.appendTextBlock(`[AGY 会话升级警告] ${activity.message}\n`);
         return false;
+      case "healed_in_turn_error":
       case "conversation_fallback":
         // Runtime/index side channel only; no assistant content.
         return false;

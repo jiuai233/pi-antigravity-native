@@ -4,7 +4,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { createNativeAgentMarkdown, NativeWorkspaceRegistration } from '../src/native/native-workspace.ts';
+import { BRIDGE_CALL_TIMEOUT_MS } from '../src/extension/bridge.ts';
+import { cliServerName, createNativeAgentMarkdown, NativeWorkspaceRegistration, sweepDeadNativeWorkspaces } from '../src/native/native-workspace.ts';
 
 const workspaceFixture = (cwd, id) => new NativeWorkspaceRegistration({ cwd, id,
   agentDir: path.join(cwd, 'pi-state'), agentRoot: path.join(cwd, 'global-agents'),
@@ -71,7 +72,7 @@ test('tool signatures derive short enums and nested required fields from their s
   try {
     workspace.writeSystemPrompt('Use Pi tools.', tools);
     const agent = await readFile(workspace.agentPath, 'utf8');
-    assert.ok(agent.includes('session_message(to, message, mode?:"followUp"|"steer")'));
+    assert.ok(agent.includes('session_message(message, mode?:"followUp"|"steer", to)'));
     assert.ok(agent.includes('decision_record(outcome:"adopted"|"rejected"|"deferred")'));
     assert.ok(agent.includes('edit(edits:{oldText,newText}[])'));
     assert.ok(agent.includes('large_enum(value)'));
@@ -98,6 +99,8 @@ test('private registrations leave project configuration unchanged and disposal p
       workspace.writeSystemPrompt('Private fixture.', []);
       const config = JSON.parse(await readFile(workspace.configPath, 'utf8'));
       assert.deepEqual(Object.keys(config.mcpServers), [workspace.serverName]);
+      // agy must not abandon a call before the bridge cap, or the Pi command is orphaned.
+      assert.ok(config.mcpServers[workspace.serverName].timeoutSeconds * 1000 > BRIDGE_CALL_TIMEOUT_MS);
       const agent = await readFile(workspace.agentPath, 'utf8');
       assert.ok(agent.includes(workspace.routingHint));
       assert.doesNotMatch(agent, /^mcpServers:/m);
@@ -140,5 +143,61 @@ test('schema cleanup does not remove a registration replaced by another owner', 
     assert.deepEqual(JSON.parse(await readFile(workspace.configPath, 'utf8')), replacement);
   } finally {
     await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('sweepDeadNativeWorkspaces removes only exact ESRCH p<pid>-<12hex> artifacts and preserves live, replaced and conversation state', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agy-dead-sweep-'));
+  const agentDir = path.join(root, 'agent');
+  const agentRoot = path.join(root, 'agents');
+  const dataDir = path.join(root, 'data');
+  const makeWs = (id) => new NativeWorkspaceRegistration({ cwd: root, id, agentDir, agentRoot, dataDirectory: dataDir });
+  const deadFull = makeWs('p40001-aaaaaaaaaaaa');
+  const deadAgentOnly = makeWs('p40002-bbbbbbbbbbbb');
+  const deadReplaced = makeWs('p40003-cccccccccccc');
+  const liveWs = makeWs('p50001-dddddddddddd');
+  const excludedWs = makeWs('p40004-eeeeeeeeeeee');
+  const nonPidWs = makeWs('owner-ffffffffffff');
+  try {
+    for (const ws of [deadFull, deadReplaced, liveWs, excludedWs, nonPidWs]) {
+      ws.registerMcpServer('http://127.0.0.1:1/mcp', 'fixture');
+      ws.writeSystemPrompt('Fixture.', []);
+      await mkdir(ws.schemaDirectory, { recursive: true });
+      await writeFile(path.join(ws.schemaDirectory, 'read.json'), '{}');
+    }
+    deadAgentOnly.writeSystemPrompt('Orphan agent.', []);
+    await mkdir(deadAgentOnly.schemaDirectory, { recursive: true });
+    await writeFile(deadReplaced.configPath, JSON.stringify({ mcpServers: { external: { serverUrl: 'http://127.0.0.1:2/mcp' } } }));
+    const unrelatedMcp = path.join(dataDir, 'mcp', 'bother9999');
+    const convDb = path.join(dataDir, 'conversations', 'keep.db');
+    const customAgent = path.join(agentRoot, 'user-custom-agent');
+    await mkdir(unrelatedMcp, { recursive: true });
+    await mkdir(path.dirname(convDb), { recursive: true });
+    await writeFile(convDb, 'sqlite');
+    await mkdir(customAgent, { recursive: true });
+
+    const deadPids = new Set([40001, 40002, 40003, 40004]);
+    const swept = sweepDeadNativeWorkspaces({
+      cwd: root, agentDir, agentRoot, dataDirectory: dataDir,
+      excludeId: excludedWs.id,
+      isDeadPid: (pid) => deadPids.has(pid),
+    });
+    assert.deepEqual(swept.sort(), [deadFull.id, deadAgentOnly.id].sort());
+    for (const ws of [deadFull, deadAgentOnly]) {
+      assert.equal(existsSync(ws.directory), false);
+      assert.equal(existsSync(ws.agentDirectory), false);
+      assert.equal(existsSync(ws.schemaDirectory), false);
+    }
+    for (const ws of [deadReplaced, liveWs, excludedWs, nonPidWs]) {
+      assert.equal(existsSync(ws.directory), true);
+      assert.equal(existsSync(ws.agentDirectory), true);
+      assert.equal(existsSync(ws.schemaDirectory), true);
+    }
+    assert.equal(existsSync(unrelatedMcp), true);
+    assert.equal(existsSync(convDb), true);
+    assert.equal(existsSync(customAgent), true);
+    assert.equal(cliServerName(deadFull.id), deadFull.serverName);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

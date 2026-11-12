@@ -324,6 +324,11 @@ export class AgyTurnController {
     return true;
   }
 
+  /** Update the conversation-cumulative usage baseline (e.g. after prefill or fresh fallback). */
+  resetConversationUsage(usage: AgyUsage = {}): void {
+    this.#reportedUsage = { ...usage };
+  }
+
   /**
    * Attribute usage exactly once across the several pi messages that make up
    * one agy turn. Step usage is per response; the result usage is cumulative

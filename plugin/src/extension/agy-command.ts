@@ -8,6 +8,7 @@ import { parseAgyAgents, readAgyProcessProfile } from "../driver/agy-profile.ts"
 import { formatAgyContextTokens } from "../native/agy-compaction.ts";
 import { readAgyConversationMetadata } from "../native/conversation-metadata.ts";
 import { agyConversationExists } from "../native/conversation-state.ts";
+import type { AgyPrefixAudit } from "../native/prefix-audit.ts";
 import { mapThinkingToEffort } from "../provider/mapping.ts";
 import { capabilitiesForModel, resolveAgyModelEffort } from "../provider/models.ts";
 import type { AntigravityRuntime, AntigravityStateSnapshot } from "../runtime/runtime.ts";
@@ -20,6 +21,7 @@ export interface AgyCommandDeps {
   sync: ConversationSync;
   catalog: ModelCatalog;
   bridge: BridgeHost;
+  audit?: AgyPrefixAudit;
   /** Re-run model discovery and re-register the provider. */
   refreshModels(): Promise<ModelCache>;
 }
@@ -110,6 +112,7 @@ async function doctor(ctx: ExtensionCommandContext, deps: AgyCommandDeps): Promi
   appendSelection(lines, ctx, deps.catalog);
   lines.push(`bridge: ${deps.bridge.describe()}`);
   await appendConversation(lines, snapshot?.conversationId);
+  if (deps.audit) lines.push(...deps.audit.details());
   ctx.ui.notify(
     lines.join("\n"),
     binary.ok && deps.catalog.cache.discoveryError === undefined ? "info" : "error",
@@ -205,7 +208,7 @@ async function appendConversation(lines: string[], conversationId: string | unde
   );
 }
 
-async function showStatus(ctx: ExtensionCommandContext, { runtime, sync }: AgyCommandDeps): Promise<void> {
+async function showStatus(ctx: ExtensionCommandContext, { runtime, sync, audit }: AgyCommandDeps): Promise<void> {
   const snapshot = runtime.snapshot();
   const id = snapshot.conversationId;
   const metadata = id ? await readAgyConversationMetadata(id) : undefined;
@@ -237,7 +240,7 @@ async function showStatus(ctx: ExtensionCommandContext, { runtime, sync }: AgyCo
     profile = `profile error: ${errorText(error)}`;
   }
   ctx.ui.notify(
-    `antigravity: ${title}\nconversation: ${id ?? "none"}\n${details.join(" · ")}\n${profile}`,
+    `antigravity: ${title}\nconversation: ${id ?? "none"}\n${details.join(" · ")}\n${profile}${audit ? `\n${audit.details().join("\n")}` : ""}`,
     "info",
   );
 }

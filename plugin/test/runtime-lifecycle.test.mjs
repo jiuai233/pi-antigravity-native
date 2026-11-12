@@ -158,8 +158,9 @@ for (const oneShot of [false, true]) {
   });
 }
 
-test('600s run budget still expires with live stream traffic after a Pi wait', async () => {
+test('an explicit 600s budget still expires with live stream traffic after a Pi wait', async () => {
   const f = fixture();
+  f.env.AGY_TURN_TIMEOUT_MS = '600000';
   const r = runtime(f, 900031); const { b, call } = bridge(f, r);
   try {
     const controller = await begin(r);
@@ -210,7 +211,10 @@ test('overlapping Pi calls resume the remaining run budget only after the last r
   } finally { budget.dispose(); }
 });
 
-test('direct one-shot retains CLI wall cap; managed one-shot uses the pauseable Pi cap', () => {
+test('one-shot waits natively by default; only explicit direct limits add a CLI wall cap', () => {
+  for (const timeoutMs of [undefined, 0]) {
+    assert.equal(buildOneShotAgyArgs({ prompt: 'fixture', timeoutMs }).includes('--print-timeout'), false);
+  }
   const direct = buildOneShotAgyArgs({ prompt: 'fixture', timeoutMs: 600000 });
   assert.ok(direct.includes('--print-timeout')); assert.ok(direct.includes('600s'));
   const managed = buildOneShotAgyArgs({ prompt: 'fixture', budget: {} });
@@ -338,12 +342,69 @@ for (const oneShot of [false, true]) {
   });
 }
 
+test('explicitly enabled stall detection exhausts only the existing two retries', async () => {
+  const f = fixture(); f.env.AGY_STALL_RETRY_BACKOFF_MS = '0';
+  f.env.AGY_STALL_TIMEOUT_MS = '120000';
+  const r = runtime(f, 900051);
+  try {
+    const controller = await begin(r);
+    await f.tick(360_001);
+    const first = await controller.next(); const second = await controller.next();
+    assert.equal(first.type, 'stall'); assert.equal(first.retry, 1);
+    assert.equal(second.type, 'stall'); assert.equal(second.retry, 2);
+    await assert.rejects(controller.next(), /stream stalled/);
+    assert.equal(f.kills.length, 3);
+  } finally { await close(r); }
+});
+
+
+test('live stream traffic after a Pi wait keeps the turn alive beyond 600s', async () => {
+  const f = fixture();
+  const r = runtime(f, 900031); const { b, call } = bridge(f, r);
+  try {
+    const controller = await begin(r);
+    const pending = await call();
+    const activity = await controller.next();
+    await f.tick(400_000);
+    b.resolveCall(activity.id, { content: 'done', isError: false });
+    await pending.response;
+    for (let i = 0; i < 12; i++) {
+      await f.tick(100_000); r.child.stderr.write('fixture heartbeat\n');
+    }
+    assert.equal(controller.isClosed(), false);
+    result(r.child); await flush();
+    assert.equal((await controller.next()).status, 'OK');
+    assert.deepEqual(f.kills, []);
+  } finally { await close(r); await b.close(); }
+});
+
+
+test('overlapping Pi calls keep silence watchdogs paused until the last result', async () => {
+  const f = fixture();
+  const budget = new AgyTurnBudget(0, () => {});
+  const states = [];
+  budget.subscribe(() => states.push(budget.paused));
+  try {
+    budget.pause('first'); budget.pause('second');
+    await f.tick(400_000); budget.resume('first', true);
+    await f.tick(400_000);
+    assert.equal(budget.paused, true);
+    assert.equal(states.every(Boolean), true);
+    budget.resume('second', true);
+    assert.equal(budget.paused, false);
+    assert.equal(states.at(-1), false);
+    assert.equal(budget.lastToolCompletedAtMs, Date.now());
+    assert.equal(f.timers.size, 0);
+  } finally { budget.dispose(); }
+});
+
+
 test('ordinary AGY silence still stalls and exhausts only the existing two retries', async () => {
   const f = fixture(); f.env.AGY_STALL_RETRY_BACKOFF_MS = '0';
   const r = runtime(f, 900051);
   try {
     const controller = await begin(r);
-    await f.tick(360_001);
+    await f.tick(900_001);
     const first = await controller.next(); const second = await controller.next();
     assert.equal(first.type, 'stall'); assert.equal(first.retry, 1);
     assert.equal(second.type, 'stall'); assert.equal(second.retry, 2);

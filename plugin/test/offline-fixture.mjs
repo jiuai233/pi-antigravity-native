@@ -17,7 +17,7 @@ export function fixture(extra = {}) {
   const mocked = extra.clock === false ? [] : [
     mock.method(Date, 'now', () => now),
     mock.method(globalThis, 'setTimeout', (fn, ms) => {
-      const id = ++seq;
+      const id = { value: ++seq, unref() { return this; }, ref() { return this; } };
       timers.set(id, { at: now + ms, fn });
       return id;
     }),

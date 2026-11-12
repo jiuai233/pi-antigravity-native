@@ -2,9 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import type { PiToolInfo } from "../extension/bridge.ts";
+import { BRIDGE_CALL_TIMEOUT_MS, canonicalToolDefinitions, type PiToolInfo } from "../extension/bridge.ts";
 import { executionSurface, type NativeProfile } from "./native-profile.ts";
 import { bridgeToolName, bridgeToolNames } from "./native-tool-names.ts";
+import { removeDeadBridgeLease, STABLE_BRIDGE_SERVER_PATTERN } from "./bridge-identity.ts";
+
+/**
+ * agy's per-server MCP limit (`timeoutSeconds`, default 180s per tool call). It must
+ * outlast the bridge cap so agy never abandons a call that Pi is still running: an
+ * abandoned call leaves the Pi command orphaned and later bridge calls queued behind it.
+ */
+export const AGY_MCP_TIMEOUT_SECONDS = Math.ceil(BRIDGE_CALL_TIMEOUT_MS / 1000) + 60;
 
 /** The subset of JSON Schema the catalog hints read. */
 interface JsonSchema {
@@ -117,7 +125,13 @@ export class NativeWorkspaceRegistration {
   }
 
   #agentContent: string | undefined;
+  #agentBody: string | undefined;
   #mcpContent: string | undefined;
+
+  /** Markdown body written to agent.md (without YAML frontmatter). */
+  get agentBody(): string | undefined {
+    return this.#agentBody;
+  }
   #cacheHooksContent: string | undefined;
   #cacheHookScriptContent: string | undefined;
   #profile: NativeProfile = executionSurface.profiles.default;
@@ -141,8 +155,8 @@ export class NativeWorkspaceRegistration {
   ): boolean {
     bridgeToolNames(this.serverName, tools.map((tool) => tool.name), this.toolPrefix);
     this.#profile = profile;
-    this.#tools = tools;
-    const catalog = tools.map(({ name, description, parameters }) => {
+    this.#tools = canonicalToolDefinitions(tools);
+    const catalog = this.#tools.map(({ name, description, parameters }) => {
       const schema = parameters as JsonSchema | undefined;
       const required = new Set(schema?.required ?? []);
       const fields = Object.entries(schema?.properties ?? {}).map(([field, fieldSchema]) => {
@@ -159,8 +173,12 @@ export class NativeWorkspaceRegistration {
       ? "Names below are the active Pi submission tools for this closed dossier."
       : "Names below are the current SDK tool declarations on this bridge.";
     const cacheHookName = profile.native_tools.includes("view_file") ? this.cacheHookName : undefined;
-    const content = createNativeAgentMarkdown(this.agentName, `${systemPrompt}\n\n${this.routingHint}\n\n<pi_active_tools>\n${catalogHint}\n${catalog}\n</pi_active_tools>`, profile, cacheHookName);
-    if (this.#agentContent === content) return false;
+    const body = `${systemPrompt}\n\n${this.routingHint}\n\n<pi_active_tools>\n${catalogHint}\n${catalog}\n</pi_active_tools>`.replace(/\s+$/, "");
+    const content = createNativeAgentMarkdown(this.agentName, body, profile, cacheHookName);
+    if (this.#agentContent === content) {
+      this.#agentBody = body;
+      return false;
+    }
     if (this.#agentContent === undefined && fs.existsSync(this.agentPath)) {
       throw new Error(`Refusing to overwrite an existing agent: ${this.agentPath}`);
     }
@@ -189,16 +207,22 @@ export class NativeWorkspaceRegistration {
     }
     fs.writeFileSync(this.agentPath, content, { encoding: "utf8", mode: 0o600 });
     this.#agentContent = content;
+    this.#agentBody = body;
     return true;
   }
 
   registerMcpServer(url: string, token: string): void {
     if (this.#mcpContent !== undefined) return;
-    const entry = { serverUrl: url, headers: { "x-pi-bridge-token": token } };
+    const entry = { serverUrl: url, headers: { "x-pi-bridge-token": token }, timeoutSeconds: AGY_MCP_TIMEOUT_SECONDS };
     const content = `${JSON.stringify({ mcpServers: { [this.serverName]: entry } }, null, 2)}\n`;
     fs.mkdirSync(path.dirname(this.configPath), { recursive: true, mode: 0o700 });
     fs.writeFileSync(this.configPath, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
     this.#mcpContent = content;
+    if (STABLE_BRIDGE_SERVER_PATTERN.test(this.serverName)) {
+      fs.writeFileSync(path.join(this.directory, "bridge-owner.json"),
+        JSON.stringify({ version: 1, id: this.id, serverName: this.serverName }),
+        { encoding: "utf8", mode: 0o600, flag: "wx" });
+    }
   }
 
   dispose(): void {
@@ -212,6 +236,7 @@ export class NativeWorkspaceRegistration {
     }
     if (removedRegistration) fs.rmSync(this.schemaDirectory, { recursive: true, force: true });
     this.#agentContent = undefined;
+    this.#agentBody = undefined;
   }
 
   #removeCacheHooks(): void {
@@ -235,4 +260,113 @@ export class NativeWorkspaceRegistration {
     this.#mcpContent = undefined;
     return true;
   }
+}
+
+const DEAD_WORKSPACE_ID_PATTERN = /^p([1-9]\d*)-[0-9a-f]{12}$/;
+const DEAD_AGENT_DIR_PATTERN = /^pi-native-(p[1-9]\d*-[0-9a-f]{12})$/;
+const MAX_DEAD_WORKSPACES_PER_SWEEP = 32;
+
+function defaultIsDeadPid(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === "ESRCH";
+  }
+}
+
+export interface SweepDeadWorkspacesOptions {
+  cwd: string;
+  agentDir?: string;
+  agentRoot?: string;
+  dataDirectory?: string;
+  maxEntries?: number;
+  excludeId?: string;
+  isDeadPid?: (pid: number) => boolean;
+}
+
+/**
+ * Best-effort cleanup of `p<pid>-<12hex>` bridge workspaces left behind by dead
+ * host processes (e.g. hard termination on Windows where `process.once("exit")`
+ * cannot run). Removes only the three exact paths derived from a confirmed
+ * `ESRCH` PID; never touches native conversations, brain, presence, live/EPERM
+ * PIDs, or non-matching directory names.
+ */
+export function sweepDeadNativeWorkspaces(options: SweepDeadWorkspacesOptions): string[] {
+  const {
+    cwd,
+    agentDir = path.join(os.homedir(), ".pi", "agent"),
+    agentRoot = path.join(os.homedir(), ".gemini", "config", "agents"),
+    dataDirectory,
+    maxEntries = MAX_DEAD_WORKSPACES_PER_SWEEP,
+    excludeId,
+    isDeadPid = defaultIsDeadPid,
+  } = options;
+  const swept: string[] = [];
+  try {
+    const bridgesRoot = path.join(agentDir, "antigravity", "bridges");
+    const candidates = new Set<string>();
+    if (fs.existsSync(bridgesRoot)) {
+      for (const entry of fs.readdirSync(bridgesRoot, { withFileTypes: true })) {
+        if (entry.isDirectory() && DEAD_WORKSPACE_ID_PATTERN.test(entry.name)) {
+          candidates.add(entry.name);
+        }
+      }
+    }
+    if (fs.existsSync(agentRoot)) {
+      for (const entry of fs.readdirSync(agentRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const match = DEAD_AGENT_DIR_PATTERN.exec(entry.name);
+        if (match) candidates.add(match[1]);
+      }
+    }
+    if (!candidates.size) return swept;
+    const agyDataDir = resolveAgyDataDirectory(path.resolve(cwd), dataDirectory);
+    for (const id of candidates) {
+      if (swept.length >= maxEntries) break;
+      if (id === excludeId) continue;
+      const match = DEAD_WORKSPACE_ID_PATTERN.exec(id);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      if (!isDeadPid(pid)) continue;
+      let serverName = cliServerName(id);
+      const bridgeDir = path.join(bridgesRoot, id);
+      const configPath = path.join(bridgeDir, ".agents", "mcp_config.json");
+      const ownerPath = path.join(bridgeDir, "bridge-owner.json");
+      if (fs.existsSync(ownerPath)) {
+        try {
+          const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+          if (owner.version !== 1 || owner.id !== id || !STABLE_BRIDGE_SERVER_PATTERN.test(owner.serverName)) continue;
+          serverName = owner.serverName;
+        } catch { continue; }
+      }
+      if (fs.existsSync(configPath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(configPath, "utf8")) as { mcpServers?: Record<string, unknown> };
+          const keys = Object.keys(parsed?.mcpServers ?? {});
+          if (keys.length !== 1 || keys[0] !== serverName) continue;
+        } catch {
+          // Half-written config from an interrupted process is still owned by this dead id.
+        }
+      }
+      try {
+        fs.rmSync(bridgeDir, { recursive: true, force: true });
+        fs.rmSync(path.join(agentRoot, `pi-native-${id}`), { recursive: true, force: true });
+        const removeSchema = () => fs.rmSync(path.join(agyDataDir, "mcp", serverName), { recursive: true, force: true });
+        if (STABLE_BRIDGE_SERVER_PATTERN.test(serverName)) {
+          // A rebuilt live instance may already own the same logical server.
+          removeDeadBridgeLease(agentDir, serverName, id, isDeadPid, removeSchema);
+        } else {
+          removeSchema();
+        }
+        swept.push(id);
+      } catch {
+        // Ignore individual removal races across concurrent Pi processes.
+      }
+    }
+  } catch {
+    // Best-effort sweep must never disrupt bridge registration.
+  }
+  return swept;
 }

@@ -2,7 +2,7 @@
 // conversation a reload may resume, when it must restart, and when agy
 // compacted on its own.
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { AgyActivity } from "../driver/reducer.ts";
 import {
@@ -16,6 +16,7 @@ import {
   AGY_CONVERSATION_STATE_ENTRY,
   type PersistedAgyConversation,
   type PersistedAgyReset,
+  restorableAgyConversation,
 } from "../native/conversation-state.ts";
 import type { AntigravityRuntime } from "../runtime/runtime.ts";
 
@@ -26,6 +27,7 @@ export interface SessionFields {
   provider: string | undefined;
   sessionId: string;
   cwd: string;
+  branch?: readonly SessionEntry[];
 }
 
 export const isStaleContextError = (error: unknown): boolean =>
@@ -34,7 +36,10 @@ export const isStaleContextError = (error: unknown): boolean =>
 /** Read session-bound fields before awaiting: Pi may replace the session meanwhile. */
 export function sessionFields(ctx: ExtensionContext): SessionFields | undefined {
   try {
-    return { provider: ctx.model?.provider, sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd };
+    const branch = typeof ctx.sessionManager.getBranch === "function"
+      ? ctx.sessionManager.getBranch()
+      : undefined;
+    return { provider: ctx.model?.provider, sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, branch };
   } catch (error) {
     if (isStaleContextError(error)) return undefined;
     throw error;
@@ -99,7 +104,11 @@ export class ConversationSync {
       nativeContractHash: snapshot.nativeContractHash,
     };
     const key = conversationStateKey(state);
-    if (key === this.persistedKey) return;
+    const anchored =
+      !session.branch ||
+      restorableAgyConversation(session.branch, session.sessionId, session.cwd)?.conversationId ===
+        state.conversationId;
+    if (key === this.persistedKey && anchored) return;
     if (this.#appendState(state)) this.persistedKey = key;
   }
 

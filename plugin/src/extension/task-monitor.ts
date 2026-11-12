@@ -77,6 +77,10 @@ export class TaskMonitor {
   };
 
   observe(activity: AgyActivity): void {
+    if (activity.type === "healed_in_turn_error") {
+      this.#ui?.notify(`中途上游卡顿 ${activity.count} 次，AGY 已自动恢复`, "info");
+      return;
+    }
     if (
       (activity.type === "tool_start" ||
         activity.type === "tool_done" ||

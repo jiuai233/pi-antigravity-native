@@ -161,7 +161,7 @@ const ZERO_PRICING: ModelPricing = {
  */
 export function pricingForModel(modelId: string, asOf = Date.now()): ModelPricing {
   if (/^gemini-4-(?:argon|carbon)$/i.test(modelId)) {
-    // Gemini API introductory reference rates expire after November 30, 2026.
+    // Argon and Carbon share the same Standard-tier rates; introductory rates expire after November 30, 2026.
     // https://ai.google.dev/gemini-api/docs/pricing
     const multiplier = asOf < Date.UTC(2026, 11, 1) ? 1 : 2;
     return { input: 2 * multiplier, output: 10 * multiplier, cacheRead: 0.1 * multiplier, cacheWrite: 0 };

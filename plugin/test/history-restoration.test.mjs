@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { piHistoryBootstrap } from '../src/input/pi-input.ts';
+import { piHistoryBootstrap, piHistoryBootstrapChunks } from '../src/input/pi-input.ts';
 
 const user = content => ({ role: 'user', content });
 const answer = text => ({ role: 'assistant', content: [{ type: 'text', text }] });
@@ -150,4 +150,88 @@ test('a large current request shrinks restored history instead of being cut off'
   assert.ok(bytes(`${restored}\n\n${request}`) < AGY_DELIVERED_BYTES);
   assert.match(restored, /Archived summary/);
   assert.ok(readFileSync(archivedFile(restored), 'utf8').includes(summaryText));
+}));
+
+test('multi-chunk bootstrap restores ~360 KB and ~720 KB histories fully inline without archiving or exceeding 176 KB per turn', () => temporaryRun(directory => {
+  for (const turnCount of [8, 16]) {
+    const messages = [];
+    const markers = [];
+    for (let i = 0; i < turnCount; i++) {
+      const uMark = `USER_TURN_MARKER_${i}_HEAD`;
+      const aMark = `ASSISTANT_TURN_MARKER_${i}_TAIL`;
+      markers.push(uMark, aMark);
+      messages.push(
+        user(`${uMark}\n` + `第 ${i} 轮用户需求细节说明。`.repeat(450)),
+        answer(`${aMark}\n` + `第 ${i} 轮模型完整推理结论与代码定位。`.repeat(450)),
+      );
+    }
+    const ask = '汇总上述所有轮次的标记。';
+    messages.push(user(ask));
+    const plan = piHistoryBootstrapChunks({ messages }, directory);
+    assert.ok(plan.prefill.length >= 1 && plan.prefill.length <= 4);
+    assert.ok(plan.bootstrap);
+    for (const chunk of plan.prefill) {
+      assert.ok(bytes(chunk) <= 176_000, `prefill chunk ${bytes(chunk)} > 176,000`);
+      assert.doesNotMatch(chunk, /Archived /);
+    }
+    assert.ok(bytes(`${plan.bootstrap}\n\n${ask}`) <= 176_000);
+    assert.doesNotMatch(plan.bootstrap, /Archived /);
+    assert.equal(existsSync(path.join(directory, 'history')), false, 'lossless multi-chunk restore should not write archive files');
+    const combined = [...plan.prefill, plan.bootstrap].join('\n\n');
+    let cursor = -1;
+    for (const marker of markers) {
+      const next = combined.indexOf(marker);
+      assert.ok(next > cursor, `marker ${marker} missing or out of chronological order`);
+      cursor = next;
+    }
+  }
+}));
+
+test('multi-chunk bootstrap shifts history into prefill when the current user request is huge', () => temporaryRun(directory => {
+  const earlierSpec = 'SPEC_ANCHOR_KEEP_WHOLE\n' + '关键历史上下文不能被压缩成 8KB 指针。'.repeat(2_200);
+  const hugeAsk = '当前超大请求：' + '请对照完整历史规格逐条核验。'.repeat(3_600);
+  const plan = piHistoryBootstrapChunks({
+    messages: [user(earlierSpec), answer('已记录全部历史规格。'), user(hugeAsk)],
+  }, directory);
+  assert.equal(plan.prefill.length, 1);
+  assert.ok(plan.prefill[0].includes('SPEC_ANCHOR_KEEP_WHOLE'));
+  assert.doesNotMatch(plan.prefill[0], /Archived /);
+  assert.ok(plan.bootstrap);
+  assert.match(plan.bootstrap, /Part 1 of the prior pi history was loaded/);
+  assert.ok(bytes(`${plan.bootstrap}\n\n${hugeAsk}`) < AGY_DELIVERED_BYTES);
+}));
+
+test('multi-chunk bootstrap condenses >900 KB history and single >172 KB monster tool outputs while keeping user turns inline', () => temporaryRun(directory => {
+  const monsterOutput = 'MONSTER_LINE '.repeat(18_000); // ~234 KB > 172 KB single-chunk cap
+  const messages = [
+    compactionSummary('COMPACTION_SUMMARY_ANCHOR ' + summaryText),
+    user('FIRST_USER_GOAL ' + '保留第一轮核心目标。'.repeat(900)),
+    call('bash', { command: 'dump-huge-log' }),
+    result('bash', monsterOutput),
+  ];
+  for (let i = 0; i < 18; i++) {
+    messages.push(
+      user(`USER_KEEP_${i} ` + '用户补充约束。'.repeat(300)),
+      call('read', { path: `module-${i}.ts` }),
+      result('read', `MODULE_BODY_${i} ` + '模块源码内容摘录。'.repeat(1_800)),
+    );
+  }
+  const ask = '继续实施。';
+  messages.push(user(ask));
+
+  const plan = piHistoryBootstrapChunks({ messages }, directory);
+  assert.equal(plan.prefill.length, 4);
+  assert.ok(plan.bootstrap);
+  for (const chunk of plan.prefill) assert.ok(bytes(chunk) <= 176_000);
+  assert.ok(bytes(`${plan.bootstrap}\n\n${ask}`) <= 176_000);
+
+  const combined = [...plan.prefill, plan.bootstrap].join('\n\n');
+  assert.ok(combined.includes('COMPACTION_SUMMARY_ANCHOR'));
+  assert.ok(combined.includes('FIRST_USER_GOAL'));
+  for (let i = 0; i < 18; i++) assert.ok(combined.includes(`USER_KEEP_${i}`));
+  // Monster 234 KB tool output is archived with exact line pointers, while recent exchanges stay inline.
+  assert.ok(!combined.includes(monsterOutput));
+  assert.match(combined, /Archived message\/tool exchange/);
+  assert.ok(combined.includes('MODULE_BODY_17'));
+  assert.ok(readFileSync(archivedFile(combined), 'utf8').includes('MONSTER_LINE'));
 }));

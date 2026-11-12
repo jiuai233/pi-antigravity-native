@@ -32,7 +32,7 @@ export function registerSessionHooks(deps: SessionHookDeps): void {
     bridge.refreshSkillTools();
     if (ctx.model?.provider === "antigravity") {
       if (ctx.model.input.includes("image")) rehydrateSessionImages(ctx.sessionManager.getBranch());
-      await bridge.ensureRegistered(ctx.ui, ctx.cwd);
+      await bridge.ensureRegistered(ctx.ui, ctx.cwd, ctx.sessionManager.getSessionId());
     }
   });
 
@@ -114,7 +114,7 @@ export function registerSessionHooks(deps: SessionHookDeps): void {
     // selected: register lazily here (session resumed on an agy model) and on
     // model_select; non-agy sessions never touch agy at all.
     if (ctx.model?.provider === "antigravity") {
-      await bridge.ensureRegistered(ctx.ui, ctx.cwd);
+      await bridge.ensureRegistered(ctx.ui, ctx.cwd, ctx.sessionManager.getSessionId());
       await deps.refreshStaleModels(ctx.ui);
     }
   });
@@ -131,7 +131,7 @@ export function registerSessionHooks(deps: SessionHookDeps): void {
     }
     selectedModelKey = nextModelKey;
     if (event.model?.provider === "antigravity") {
-      await bridge.ensureRegistered(ctx.ui, ctx.cwd);
+      await bridge.ensureRegistered(ctx.ui, ctx.cwd, ctx.sessionManager.getSessionId());
       await deps.refreshStaleModels(ctx.ui);
     } else {
       await bridge.teardown();

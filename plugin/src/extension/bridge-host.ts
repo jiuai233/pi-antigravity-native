@@ -3,12 +3,14 @@
 // only exists while an Antigravity model is selected.
 
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { type AgyProcessProfile, readAgyProcessProfile } from "../driver/agy-profile.ts";
 import { bridgeToolName } from "../native/native-tool-names.ts";
-import { cliServerName, NativeWorkspaceRegistration } from "../native/native-workspace.ts";
+import { cliServerName, NativeWorkspaceRegistration, resolveAgyDataDirectory, sweepDeadNativeWorkspaces } from "../native/native-workspace.ts";
+import { acquireNativeBridgeLease, releaseRetiredNativeBridgeLease, stableBridgeIdentity, type NativeBridgeLease } from "../native/bridge-identity.ts";
 import type { AntigravityRuntime } from "../runtime/runtime.ts";
 import { AgyPiBridge, type PiToolInfo } from "./bridge.ts";
 import { type BridgeLifecycleManager, createBridgeLifecycleManager } from "./bridge-lifecycle.ts";
@@ -19,6 +21,7 @@ import { ToolProjection } from "./tool-projection.ts";
 // never selects a workspace (Pi Web builds model-only runtimes, never shut down)
 // then leaves no listener behind holding the whole extension instance.
 const LIVE_WORKSPACES_KEY = Symbol.for("pi-antigravity-native:live-workspaces");
+let deadWorkspacesSwept = false;
 function liveWorkspaces(): Set<NativeWorkspaceRegistration> {
   const registry = globalThis as unknown as { [LIVE_WORKSPACES_KEY]?: Set<NativeWorkspaceRegistration> };
   if (!registry[LIVE_WORKSPACES_KEY]) {
@@ -46,19 +49,23 @@ export function captureSkills(skills: unknown): SkillLite[] | undefined {
 }
 
 type BridgeRuntime = Pick<AntigravityRuntime, "pushBridgeCall" | "finishBridgeCall">;
+type WorkspacePaths = { agentDir?: string; agentRoot?: string; dataDirectory?: string };
 
 export class BridgeHost {
   readonly bridge: AgyPiBridge;
   readonly projection: ToolProjection;
   readonly processRevision: () => string;
   readonly #id: string;
-  readonly #serverName: string;
+  #serverName: string;
+  #lease: NativeBridgeLease | undefined;
   readonly #manager: BridgeLifecycleManager;
   #workspace: NativeWorkspaceRegistration | undefined;
   #skills: SkillLite[] = [];
+  readonly #workspacePaths: WorkspacePaths;
 
   /** sessionCwd: workspace-local skills there are discovered by agy itself. */
-  constructor(runtime: BridgeRuntime, sessionCwd: () => string | undefined) {
+  constructor(runtime: BridgeRuntime, sessionCwd: () => string | undefined, workspacePaths: WorkspacePaths = {}) {
+    this.#workspacePaths = workspacePaths;
     this.#id = `p${process.pid}-${randomUUID().replace(/-/g, "").slice(0, 12)}`;
     this.#serverName = cliServerName(this.#id);
     const bridge = new AgyPiBridge(this.#serverName);
@@ -106,20 +113,53 @@ export class BridgeHost {
     this.projection.refreshSkillTools();
   }
 
-  async ensureRegistered(ui?: ExtensionUIContext, cwd = process.cwd()): Promise<void> {
+  async ensureRegistered(ui?: ExtensionUIContext, cwd = process.cwd(), sessionId?: string): Promise<void> {
     const resolvedCwd = path.resolve(cwd);
-    if (this.#workspace && this.#workspace.cwd !== resolvedCwd) {
-      await this.#manager.teardown();
-      this.#dropWorkspace();
+    const agentDir = this.#workspacePaths.agentDir ?? getAgentDir();
+    const nextServer = sessionId
+      ? stableBridgeIdentity(agentDir, resolvedCwd, sessionId).serverName : cliServerName(this.#id);
+    if (this.#workspace && (this.#workspace.cwd !== resolvedCwd || this.#serverName !== nextServer)) {
+      await this.teardown();
     }
     if (!this.#workspace) {
-      this.#workspace = new NativeWorkspaceRegistration({
-        cwd: resolvedCwd, id: this.#id, serverName: this.#serverName, agentDir: getAgentDir(),
-      });
-      liveWorkspaces().add(this.#workspace);
+      this.#lease = sessionId ? acquireNativeBridgeLease({
+        agentDir, cwd: resolvedCwd, sessionId, ownerId: this.#id,
+        onDeadOwner: (_ownerId, serverName) => {
+          // The previous process is confirmed dead and the lease transaction
+          // excludes another registrant while its CLI cache is cleared.
+          fs.rmSync(path.join(resolveAgyDataDirectory(resolvedCwd, this.#workspacePaths.dataDirectory), "mcp", serverName),
+            { recursive: true, force: true });
+        },
+      }) : undefined;
+      try {
+        this.#serverName = nextServer;
+        this.bridge.setServerName(nextServer);
+        this.#workspace = new NativeWorkspaceRegistration({
+          ...this.#workspacePaths, cwd: resolvedCwd, id: this.#id, serverName: nextServer, agentDir,
+        });
+        liveWorkspaces().add(this.#workspace);
+      } catch (error) {
+        // A failed setup has no live transport to protect. A running bridge
+        // must keep its lease even when rebinding fails.
+        if (this.#lease && !this.bridge.running && this.bridge.pendingCount === 0) {
+          releaseRetiredNativeBridgeLease(this.#lease, () => this.#dropWorkspace());
+          this.#lease = undefined;
+        }
+        throw error;
+      }
     }
     const registered = await this.#manager.ensureRegistered((warning) => ui?.notify(warning, "warning"));
-    if (!registered) throw new Error("Pi workspace bridge could not be registered.");
+    if (!registered) {
+      await this.teardown();
+      throw new Error("Pi workspace bridge could not be registered.");
+    }
+    if (!deadWorkspacesSwept) {
+      deadWorkspacesSwept = true;
+      const ownId = this.#id;
+      setTimeout(() => {
+        sweepDeadNativeWorkspaces({ ...this.#workspacePaths, cwd: resolvedCwd, agentDir, excludeId: ownId });
+      }, 0).unref();
+    }
   }
 
   async prepareAgent(systemPrompt: string, declaredTools: readonly PiToolInfo[]) {
@@ -131,7 +171,11 @@ export class BridgeHost {
 
   async teardown(): Promise<void> {
     await this.#manager.teardown();
-    this.#dropWorkspace();
+    // Only retire after close completed. Retain failed private-file cleanup
+    // together with the lease, so a reload can retry it before a new owner.
+    if (this.#lease) releaseRetiredNativeBridgeLease(this.#lease, () => this.#dropWorkspace());
+    else this.#dropWorkspace();
+    this.#lease = undefined;
   }
 
   processProfile(): AgyProcessProfile {

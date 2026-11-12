@@ -8,10 +8,6 @@ const baseline = JSON.parse(fs.readFileSync(new URL("./golden/baseline.json", im
 
 function firstDifference(expected, actual, at = "$") {
   if (Object.is(expected, actual)) return undefined;
-  if (typeof expected === "string" && typeof actual === "string") {
-    const paths = value => value.replace(/<(?:TMP|HOME)>[^\s"'`<>)]*/g, part => part.replace(/\\+/g, "/"));
-    if (paths(expected) === paths(actual)) return undefined;
-  }
   if (typeof expected !== "object" || typeof actual !== "object" || expected === null || actual === null) {
     return `${at}: expected ${JSON.stringify(expected)?.slice(0, 300)} got ${JSON.stringify(actual)?.slice(0, 300)}`;
   }

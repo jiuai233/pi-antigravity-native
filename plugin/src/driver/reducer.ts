@@ -21,6 +21,7 @@ const MIN_VISIBLE_THOUGHT_TOKENS = 64;
 
 export type AgyActivity =
   | { type: "native_migration_warning"; message: string }
+  | { type: "healed_in_turn_error"; count: number }
   | { type: "tool_start"; stepId?: number; name: string; args: Record<string, unknown> }
   | {
       type: "tool_done";

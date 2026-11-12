@@ -6,8 +6,9 @@ import { mock, test } from 'node:test';
 import extension from '../index.ts';
 
 const patchedBinary = path.join(os.homedir(), '.gemini', 'bin', 'agy-512k');
+const keepaliveBinary = path.join(os.homedir(), '.gemini', 'bin', 'agy-512k-keepalive');
 
-function configure(t, { platform, exists, binary, autoUpdate }) {
+function configure(t, { platform, exists, keepalive = false, binary, autoUpdate }) {
   const descriptor = Object.getOwnPropertyDescriptor(process, 'platform');
   const keys = ['AGY_BINARY', 'AGY_CLI_DISABLE_AUTO_UPDATE', 'PI_CODING_AGENT_DIR'];
   const previous = new Map(keys.map(key => [key, process.env[key]]));
@@ -19,7 +20,7 @@ function configure(t, { platform, exists, binary, autoUpdate }) {
   }
   Object.defineProperty(process, 'platform', { ...descriptor, value: platform });
   const originalExists = fs.existsSync;
-  const mocked = mock.method(fs, 'existsSync', file => file === patchedBinary ? exists : originalExists(file));
+  const mocked = mock.method(fs, 'existsSync', file => file === patchedBinary ? exists : file === keepaliveBinary ? keepalive : originalExists(file));
   t.after(() => {
     mocked.mock.restore();
     Object.defineProperty(process, 'platform', descriptor);
@@ -36,6 +37,17 @@ test('macOS selects an existing 512K binary and disables its automatic update', 
   configure(t, { platform: 'darwin', exists: true });
   assert.equal(process.env.AGY_BINARY, patchedBinary);
   assert.equal(process.env.AGY_CLI_DISABLE_AUTO_UPDATE, 'true');
+});
+
+test('macOS prefers an installed keepalive copy when no binary is explicitly selected', t => {
+  configure(t, { platform: 'darwin', exists: true, keepalive: true });
+  assert.equal(process.env.AGY_BINARY, keepaliveBinary);
+  assert.equal(process.env.AGY_CLI_DISABLE_AUTO_UPDATE, 'true');
+});
+
+test('an explicit 512K binary opts out of automatic keepalive selection', t => {
+  configure(t, { platform: 'darwin', exists: true, keepalive: true, binary: patchedBinary });
+  assert.equal(process.env.AGY_BINARY, patchedBinary);
 });
 
 test('macOS without a patched binary keeps standard binary discovery', t => {

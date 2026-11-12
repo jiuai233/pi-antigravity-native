@@ -18,10 +18,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { installAgyDeathHooks } from "./src/driver/agy-children.ts";
-import { type AgyModelInfo, toProviderModel } from "./src/provider/models.ts";
-import { AgyReplayStore, tagNativeReplayResult } from "./src/provider/replay.ts";
 import { registerAgyCommand } from "./src/extension/agy-command.ts";
 import { BridgeHost } from "./src/extension/bridge-host.ts";
 import { ConversationSync, registerCompactionRenderer } from "./src/extension/conversation-sync.ts";
@@ -30,24 +28,40 @@ import { registerPanelCommands } from "./src/extension/panel-commands.ts";
 import { registerSessionHooks } from "./src/extension/session-hooks.ts";
 import { TaskMonitor } from "./src/extension/task-monitor.ts";
 import { registerWrapperTool } from "./src/extension/wrapper-tool.ts";
+import { AgyPrefixAudit, PREFIX_AUDIT_ENTRY } from "./src/native/prefix-audit.ts";
+import { type AgyModelInfo, toProviderModel } from "./src/provider/models.ts";
+import { AgyReplayStore, tagNativeReplayResult } from "./src/provider/replay.ts";
 import { type StreamAntigravityOptions, streamAntigravity } from "./src/provider/stream.ts";
 import { createAntigravityRuntime } from "./src/runtime/runtime.ts";
 
 export default function antigravityExtension(pi: ExtensionAPI): void {
   if (process.platform === "darwin" && !process.env.AGY_BINARY) {
-    const patchedBinary = path.join(os.homedir(), ".gemini", "bin", "agy-512k");
-    if (fs.existsSync(patchedBinary)) {
+    const patchedBinary = ["agy-512k-keepalive", "agy-512k"]
+      .map(name => path.join(os.homedir(), ".gemini", "bin", name))
+      .find(file => fs.existsSync(file));
+    if (patchedBinary) {
       process.env.AGY_BINARY = patchedBinary;
       process.env.AGY_CLI_DISABLE_AUTO_UPDATE ??= "true";
     }
   }
   installAgyDeathHooks();
-  const runtime = createAntigravityRuntime(undefined, (event) =>
-    pi.appendEntry("pi-antigravity-turn-diagnostic", { version: 1, ...event }));
+  let auditUI: ExtensionUIContext | undefined;
+  const refreshAuditStatus = () => {
+    try { auditUI?.setStatus("agy-cache", audit.summary()); }
+    catch { /* The UI may have detached; durable diagnostics remain available. */ }
+  };
+  const audit = new AgyPrefixAudit(event => {
+    pi.appendEntry(PREFIX_AUDIT_ENTRY, event);
+  }, refreshAuditStatus);
+  const runtime = createAntigravityRuntime(undefined, event => {
+    try { pi.appendEntry("pi-antigravity-turn-diagnostic", { version: 1, ...event }); }
+    finally { audit.recordDiagnostic(event); }
+  });
   const replay = new AgyReplayStore();
   const catalog = new ModelCatalog();
   const sync = new ConversationSync(runtime, (customType, data) => pi.appendEntry(customType, data));
   const monitor = new TaskMonitor(runtime);
+  const nativeConversation = () => runtime.snapshot().conversationId;
 
   registerCompactionRenderer(pi);
 
@@ -57,7 +71,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     runtime,
     replay,
     bridge: bridge.bridge,
-    onSettled: monitor.update,
+    onSettled: () => {
+      monitor.update();
+      audit.sample(runtime.snapshot().conversationId, monitor.sessionCwd);
+    },
     /** Active-tool snapshot for the provider's native re-execution fallback. */
     isActiveTool: (name) => {
       try {
@@ -69,12 +86,18 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     onActivity: (activity) => {
       sync.observe(activity);
       monitor.observe(activity);
+      audit.observeActivity(activity, nativeConversation, monitor.sessionCwd);
     },
     createIsolatedRuntime: createAntigravityRuntime,
     getModelInfo: (modelId) => catalog.find(modelId),
     getProcessProfile: () => bridge.processProfile(),
     getBridgeRevision: bridge.processRevision,
-    prepareAgent: (systemPrompt, declaredTools) => bridge.prepareAgent(systemPrompt, declaredTools),
+    prepareAgent: async (systemPrompt, declaredTools) => {
+      const prepared = await bridge.prepareAgent(systemPrompt, declaredTools);
+      audit.recordLocal(systemPrompt, declaredTools, prepared);
+      audit.sample(runtime.snapshot().conversationId, monitor.sessionCwd);
+      return prepared;
+    },
   };
 
   /**
@@ -109,6 +132,23 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   registerWrapperTool(pi, replay);
   registerProvider(catalog.models);
   registerSessionHooks({ pi, runtime, sync, monitor, bridge, refreshStaleModels });
-  registerAgyCommand(pi, { runtime, sync, catalog, bridge, refreshModels });
+  registerAgyCommand(pi, { runtime, sync, catalog, bridge, refreshModels, audit });
   registerPanelCommands(pi, runtime, monitor);
+
+  // Journal entries are not model messages. No timer or text/thinking-delta scan.
+  const restoreAudit = (_event: unknown, ctx: ExtensionContext) => {
+    auditUI = ctx.hasUI && ctx.model?.provider === "antigravity" ? ctx.ui : undefined;
+    audit.restore(ctx.sessionManager.getBranch());
+  };
+  pi.on("session_start", restoreAudit);
+  pi.on("session_tree", restoreAudit);
+  pi.on("model_select", (event, ctx) => {
+    try { ctx.ui.setStatus("agy-cache", undefined); } catch { /* Detached UI is not a model failure. */ }
+    auditUI = ctx.hasUI && event.model.provider === "antigravity" ? ctx.ui : undefined;
+    refreshAuditStatus();
+  });
+  pi.on("session_shutdown", () => {
+    try { auditUI?.setStatus("agy-cache", undefined); } catch { /* Shutdown must continue after UI detach. */ }
+    auditUI = undefined;
+  });
 }

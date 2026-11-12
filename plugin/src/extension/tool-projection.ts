@@ -4,7 +4,7 @@
 
 import { nativeBridgedTools, nativeContractHash, readNativeProfile } from "../native/native-profile.ts";
 import type { NativeWorkspaceRegistration } from "../native/native-workspace.ts";
-import { type AgyPiBridge, type BridgeToolDef, type PiToolInfo, selectBridgedTools } from "./bridge.ts";
+import { type AgyPiBridge, type BridgeToolDef, type PiToolInfo, canonicalToolDefinitions, selectBridgedTools } from "./bridge.ts";
 import {
   ACTIVATE_SKILL_TOOL_NAME,
   activateSkillDescription,
@@ -42,6 +42,7 @@ export class ToolProjection {
 
   /** Publish one activate_skill tool for global Pi skills. */
   refreshSkillTools(profile: NativeProfile = this.#readProfile()): void {
+    this.#bridge.setReadable(profile.native_tools.includes("view_file"));
     const skills = this.#skills();
     if (skills.length === 0 || profile.id === "evidence_only_v1") {
       this.#bridge.setDynamicTools([]);
@@ -60,12 +61,16 @@ export class ToolProjection {
   /** Replace the snapshot from this request's declared tools and rewrite the agent. */
   prepare(workspace: NativeWorkspaceRegistration, systemPrompt: string, declaredTools: readonly PiToolInfo[]) {
     const profile = this.#readProfile();
-    this.#snapshot = nativeBridgedTools(
+    this.#snapshot = canonicalToolDefinitions(nativeBridgedTools(
       selectBridgedTools([...declaredTools], declaredTools.map((tool) => tool.name)), profile,
-    );
+    ));
     this.refreshSkillTools(profile);
     workspace.writeSystemPrompt(systemPrompt, this.#snapshot, profile);
-    return { name: workspace.agentName, nativeTools: profile.native_tools,
-      nativeContractHash: nativeContractHash(profile, this.#snapshot) };
+    return {
+      name: workspace.agentName,
+      nativeTools: profile.native_tools,
+      nativeContractHash: nativeContractHash(profile, this.#snapshot),
+      agentBody: workspace.agentBody,
+    };
   }
 }

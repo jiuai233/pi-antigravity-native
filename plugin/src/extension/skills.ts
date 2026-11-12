@@ -80,7 +80,7 @@ export function usableSkillCatalog(skills: SkillLite[]): SkillLite[] {
     seen.add(skill.name);
     out.push(skill);
   }
-  return out;
+  return out.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
 }
 
 export function findSkillByName(skills: SkillLite[], name: string): SkillLite | undefined {

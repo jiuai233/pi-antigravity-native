@@ -1,4 +1,4 @@
-/** Renewable model-step budget, excluding time blocked on Pi bridge results. */
+/** Optional model-step budget; 0 follows AGY's unlimited native wait. */
 export class AgyTurnBudget {
   #remaining: number;
   #timeoutMs: number;
@@ -12,7 +12,7 @@ export class AgyTurnBudget {
 
   constructor(timeoutMs: number, onTimeout: () => void) {
     this.#onTimeout = onTimeout;
-    this.#remaining = this.#timeoutMs = timeoutMs;
+    this.#remaining = this.#timeoutMs = timeoutMs === 0 ? Infinity : timeoutMs;
     this.#arm();
   }
 
@@ -68,6 +68,6 @@ export class AgyTurnBudget {
   }
 
   #arm(): void {
-    this.#timer = setTimeout(this.#onTimeout, this.#remaining);
+    if (Number.isFinite(this.#remaining)) this.#timer = setTimeout(this.#onTimeout, this.#remaining);
   }
 }

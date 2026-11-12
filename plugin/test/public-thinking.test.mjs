@@ -324,7 +324,7 @@ test('cancel drains observed thinking before the queued tool without displaying 
   c.close();
 });
 
-for (const oneShot of [false, true]) test(`${oneShot ? 'one-shot' : 'persistent'} native progress resets silence, not the model wall budget`, async () => {
+for (const oneShot of [false, true]) test(`${oneShot ? 'one-shot' : 'persistent'} standalone calls retain their explicit wall cap while native progress resets silence`, async () => {
   const f = fixture();
   const child = f.child(987654);
   f.childrenHost.spawnSync = (_cmd, args) => {

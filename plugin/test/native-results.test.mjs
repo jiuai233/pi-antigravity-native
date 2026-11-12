@@ -7,7 +7,9 @@ import { pathToFileURL } from 'node:url';
 import { BinaryWriter, WireType } from '@bufbuild/protobuf/wire';
 import test from 'node:test';
 import {
+  applyAgentPromptSections,
   decodeNativeToolResult,
+  parseAgentPromptSections,
   readNativeToolResult,
   upgradeNativeConversationDb,
 } from '../src/native/native-results.ts';
@@ -196,4 +198,94 @@ test('closed migration removes native whitelist entries from all restore records
 test('a missing conversation is unchanged and is not created', () => legacyFixture(({ cwd }) => {
   assert.deepEqual(upgradeNativeConversationDb('absent', cwd), { status: 'unchanged' });
   assert.equal(fs.existsSync(path.join(cwd, 'cli-data/conversations/absent.db')), false);
+}));
+
+test('custom-agent markdown sections patch persisted AgentConfig field_2 idempotently while keeping fences and field_5', () => legacyFixture(({ cwd, database }) => {
+  const markdown = [
+    '---',
+    'name: pi-native-fixture',
+    'tools: [view_file, generate_image]',
+    '---',
+    '',
+    'Base system instructions.',
+    '```bash',
+    '# comment inside code fence stays in System Prompt',
+    'echo ok',
+    '```',
+    '',
+    '# 行为准则',
+    '',
+    'Direct partner style.',
+    '~~~python',
+    '# another fenced comment',
+    '~~~',
+    '',
+    '# AGENTS.md',
+    '',
+    '## Subheading stays inside AGENTS.md',
+    'Repo rules.',
+    '',
+  ].join('\n');
+
+  const sections = parseAgentPromptSections(markdown);
+  assert.deepEqual(sections.map(s => s.title), ['System Prompt', '行为准则', 'AGENTS.md']);
+  assert.match(sections[0].content, /# comment inside code fence/);
+  assert.match(sections[1].content, /# another fenced comment/);
+  assert.match(sections[2].content, /## Subheading stays inside AGENTS\.md/);
+
+  // Verify unknown fields (e.g. field 5 internal checks) survive applyAgentPromptSections.
+  const field5Check = new BinaryWriter().tag(5, WireType.LengthDelimited).string('message_continue_check').finish();
+  const patchedSpec = applyAgentPromptSections(Buffer.from(field5Check), sections);
+  assert.ok(patchedSpec.includes(Buffer.from('message_continue_check')));
+
+  assert.deepEqual(upgradeNativeConversationDb('legacy', cwd, ['view_file', 'generate_image'], markdown), { status: 'migrated' });
+  assert.deepEqual(upgradeNativeConversationDb('legacy', cwd, ['view_file', 'generate_image'], markdown), { status: 'unchanged' });
+  for (const record of storedMetadata(database)) {
+    assert.ok(record.includes(Buffer.from('Base system instructions.')));
+    assert.ok(record.includes(Buffer.from('行为准则')));
+    assert.ok(record.includes(Buffer.from('Repo rules.')));
+    assert.ok(record.includes(Buffer.from('generate_image')));
+  }
+
+  const updatedMarkdown = markdown.replace('Repo rules.', 'Updated repo rules v2 + new tool schema.');
+  assert.deepEqual(upgradeNativeConversationDb('legacy', cwd, ['view_file'], updatedMarkdown), { status: 'migrated' });
+  assert.deepEqual(upgradeNativeConversationDb('legacy', cwd, ['view_file'], updatedMarkdown), { status: 'unchanged' });
+  for (const record of storedMetadata(database)) {
+    assert.ok(record.includes(Buffer.from('Updated repo rules v2 + new tool schema.')));
+    assert.ok(!record.includes(Buffer.from('Repo rules.\n')));
+    assert.ok(!record.includes(Buffer.from('generate_image')));
+  }
+}));
+
+test('resumed custom-agent sections preserve mixed source line endings in every metadata store', () => {
+  for (const frontmatterEol of ['\n', '\r\n']) legacyFixture(({ cwd, database }) => {
+    const repoRules = 'First rule.\r\n```text\r\n# Not a section\r\n```\r\nLast rule.\nLF tail.';
+    const frontmatter = ['---', 'name: pi-native-fixture', '---', ''].join(frontmatterEol);
+    const markdown = `${frontmatter}\nBase instructions.\n\n# AGENTS.md\n\n${repoRules}\n\n# Tools\r\n\r\nKeep tools.\r\n`;
+    assert.deepEqual(parseAgentPromptSections(markdown), [
+      { title: 'System Prompt', content: 'Base instructions.' },
+      { title: 'AGENTS.md', content: repoRules },
+      { title: 'Tools', content: 'Keep tools.' },
+    ]);
+    assert.equal(upgradeNativeConversationDb('legacy', cwd, ['view_file'], markdown).status, 'migrated');
+    for (const record of storedMetadata(database)) {
+      assert.ok(record.includes(Buffer.from(repoRules)), 'resuming must preserve prompt bytes, including CRLF');
+    }
+    assert.equal(upgradeNativeConversationDb('legacy', cwd, ['view_file'], markdown).status, 'unchanged');
+  });
+});
+
+test('metadata rows or empty metadata tables without CustomAgentSpec fail closed', () => legacyFixture(({ cwd, database }) => {
+  const noSpec = Buffer.from([0x08, 0x01]);
+  database.prepare('UPDATE executor_metadata SET data = ?').run(noSpec);
+  database.prepare('UPDATE trajectory_metadata_blob SET data = ?').run(noSpec);
+  database.prepare('UPDATE gen_metadata SET data = ?').run(noSpec);
+  const res = upgradeNativeConversationDb('legacy', cwd, [], 'Body');
+  assert.equal(res.status, 'failed');
+  assert.match(res.message, /no CustomAgentSpec record found/);
+
+  database.exec('DELETE FROM executor_metadata; DELETE FROM trajectory_metadata_blob; DELETE FROM gen_metadata;');
+  const emptyRes = upgradeNativeConversationDb('legacy', cwd, [], 'Body');
+  assert.equal(emptyRes.status, 'failed');
+  assert.match(emptyRes.message, /no CustomAgentSpec record found/);
 }));

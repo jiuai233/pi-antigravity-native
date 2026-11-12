@@ -50,7 +50,7 @@ agy 换版本后先实测新上限（末尾口令法，见 `pitfalls.md`），�
 
 - 去掉 `view_file` 会让这些功能失效：读归档历史、读超长请求的全文、图片输入（插件靠 `view_file` 把图片交给模型）。插件按是否包含 `view_file` 决定能不能给模型归档路径。
 - 加别的原生工具（终端、写文件等）会绕过 Pi 的权限钩子和白名单，慎重。
-- 改了以后原生合同哈希变化，下一轮自动新建原生会话。
+- 原生工具白名单变化会更新合同哈希；生成 agent 在下一轮通过事务迁移现有会话配置，非生成 agent 重建会话。
 
 ## 5. 模型能力和价格
 
@@ -61,7 +61,9 @@ agy 换版本后先实测新上限（末尾口令法，见 `pitfalls.md`），�
 
 ## 6. 路径和环境变量
 
-- `AGY_BINARY`：agy 可执行文件。
+- `AGY_BINARY`：agy 可执行文件，优先于 macOS 自动副本选择。
+- `AGY_TURN_TIMEOUT_MS`：模型步骤预算，默认 0。
+- `AGY_STALL_TIMEOUT_MS`、`AGY_TOOL_STALL_TIMEOUT_MS`：普通和工具静默时限，默认 300,000、600,000 毫秒；0 表示禁用。
 - `JETSKI_APP_DATA_DIR`：agy 数据目录（默认 `~/.gemini/antigravity-cli`），插件读写会话库时也认它。
 - `PI_CODING_AGENT_DIR`：Pi agent 目录，插件的桥配置和模型缓存跟着走。
 - 写回 Pi 历史的工具结果截到 16,000 字符：`src/extension/wrapper-tool.ts`、`src/provider/native-cards.ts`（`view_file` 不截）。
@@ -80,6 +82,8 @@ agy 换版本后先实测新上限（末尾口令法，见 `pitfalls.md`），�
 npm ci --ignore-scripts --no-audit --no-fund
 npm test
 npm run typecheck
+python3 -I skills/agy-native-setup/scripts/test_keepalive_patch.py
+node --test plugin/test/bridge-reload.e2e.mjs
 ```
 
 默认测试使用临时文件和离线活动，不启动 AGY，不调用模型。Pi SDK、TUI 和 TypeBox 的开发实体版本固定在根目录 `package-lock.json`。

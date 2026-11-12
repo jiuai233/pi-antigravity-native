@@ -20,6 +20,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { fitBridgeToolOutput, MAX_BRIDGE_OUTPUT_BYTES } from "../input/pi-input.ts";
 import { WRAPPER_TOOL_NAME } from "../input/prompt.ts";
 import { bridgeToolName, bridgeToolNames } from "../native/native-tool-names.ts";
 
@@ -27,6 +28,8 @@ export const BRIDGE_SERVER_NAME = "pi-bridge";
 export const BRIDGE_TOOL_PREFIX = "pi__";
 /** Wall-clock cap on one Pi tool call; logical AGY run time is paused while waiting. */
 export const BRIDGE_CALL_TIMEOUT_MS = 480_000;
+/** Budget reserved per MCP image block for agy's `[Resource offloaded to ...]` line. */
+const RESERVED_MEDIA_LINE_BYTES = 256;
 
 export interface BridgeToolDef {
   /** Real pi tool name (without the `pi__` prefix). */
@@ -99,7 +102,7 @@ interface JsonRpcRequest {
   };
 }
 
-function canonicalValue(value: unknown): unknown {
+export function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalValue);
   if (typeof value !== "object" || value === null) return value;
   const object = value as Record<string, unknown>;
@@ -114,6 +117,12 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(canonicalValue(value));
 }
 
+/** Stable object/member order; JSON arrays keep their semantic/presentation order. */
+export function canonicalToolDefinitions<T extends PiToolInfo>(tools: readonly T[]): T[] {
+  return tools.map((tool) => ({ ...tool, parameters: canonicalValue(tool.parameters) }))
+    .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+}
+
 export class AgyPiBridge {
   #tools: BridgeToolDef[] = [];
   #server: Server | undefined;
@@ -123,7 +132,8 @@ export class AgyPiBridge {
   /** Shared secret agy must send on every request; unset = no auth (tests). */
   #token: string | undefined;
   /** Per-session server name so concurrent pi sessions cannot hijack each other's registration. */
-  readonly serverName: string;
+  #serverName: string;
+  get serverName(): string { return this.#serverName; }
   /**
    * Prefix applied before CLI-safe aliasing. Legacy callers use `pi__`;
    * native sessions use an empty prefix with a private per-instance server.
@@ -141,6 +151,8 @@ export class AgyPiBridge {
   #catalogRevision = 0;
   #nameToPi = new Map<string, string>();
   #catalog: Array<{ name: string; description: string; inputSchema: unknown }> = [];
+  #readable = true;
+  #archiveDirectory: string | undefined;
 
   readonly #createServer: typeof createServer;
 
@@ -148,8 +160,15 @@ export class AgyPiBridge {
     serverName: string = BRIDGE_SERVER_NAME,
     serverFactory: typeof createServer = createServer,
   ) {
-    this.serverName = serverName;
+    this.#serverName = serverName;
     this.#createServer = serverFactory;
+  }
+
+  /** Change the logical identity only while no transport or pending call exists. */
+  setServerName(serverName: string): void {
+    if (this.#server || this.#pending.size) throw new Error("Cannot rebind a running Pi bridge.");
+    this.#serverName = serverName;
+    this.#updateCatalogRevision();
   }
 
   /** Require `token` in the x-pi-bridge-token header on every request. */
@@ -173,6 +192,16 @@ export class AgyPiBridge {
 
   setToolSource(toolSource: () => BridgeToolDef[]): void {
     this.#toolSource = toolSource;
+  }
+
+  /** Whether native `view_file` is available to read archived full outputs. */
+  setReadable(readable: boolean): void {
+    this.#readable = readable;
+  }
+
+  /** Override the archive root directory (used by isolated tests). */
+  setArchiveDirectory(directory: string | undefined): void {
+    this.#archiveDirectory = directory;
   }
 
   /** Refresh the exposed-tool snapshot and report whether canonical content changed. */
@@ -212,12 +241,12 @@ export class AgyPiBridge {
           name: bridgeToolName(this.serverName, tool.name, this.#toolPrefix),
           description:
             tool.description || `pi tool "${tool.name}" bridged into agy by ${BRIDGE_SERVER_NAME}.`,
-          inputSchema: tool.parameters,
+          inputSchema: canonicalValue(tool.parameters),
         })),
       ...[...this.#dynamic].map(([name, definition]) => ({
         name: bridgeToolName(this.serverName, name, this.#toolPrefix),
         description: definition.description,
-        inputSchema: definition.parameters,
+        inputSchema: canonicalValue(definition.parameters),
       })),
     ].sort((a, b) => a.name.localeCompare(b.name));
     this.#nameToPi = names;
@@ -379,9 +408,7 @@ export class AgyPiBridge {
         return {
           ...base,
           result: {
-            content: Array.isArray(result.content)
-              ? result.content
-              : [{ type: "text", text: result.content }],
+            content: this.#formatToolCallContent(result.content),
             isError: result.isError,
           },
         };
@@ -392,6 +419,80 @@ export class AgyPiBridge {
           error: { code: -32601, message: `Method not found: ${rpc.method}` },
         };
     }
+  }
+
+  #formatToolCallContent(content: string | BridgeContent[]): BridgeContent[] {
+    if (typeof content === "string") {
+      return [
+        {
+          type: "text",
+          text: fitBridgeToolOutput(content, {
+            readable: this.#readable,
+            directory: this.#archiveDirectory,
+          }),
+        },
+      ];
+    }
+    const textParts = content.filter(
+      (part): part is Extract<BridgeContent, { type: "text" }> => part.type === "text",
+    );
+    const imageParts = content.filter(
+      (part): part is Extract<BridgeContent, { type: "image" }> => part.type === "image",
+    );
+    const maxBytes = Math.max(
+      1_024,
+      MAX_BRIDGE_OUTPUT_BYTES - imageParts.length * RESERVED_MEDIA_LINE_BYTES,
+    );
+    const joinedText = textParts.map((part) => part.text).join("\n");
+    if (Buffer.byteLength(joinedText, "utf8") <= maxBytes) {
+      return content;
+    }
+    if (textParts.length > 1 && textParts[0].text.startsWith("[New message from the user,")) {
+      const avail = maxBytes - 1;
+      const half = Math.floor(avail / 2);
+      const steerRaw = textParts[0].text;
+      const steerBytes = Buffer.byteLength(steerRaw, "utf8");
+      const toolText = textParts.slice(1).map((part) => part.text).join("\n");
+      const toolBytes = Buffer.byteLength(toolText, "utf8");
+      let fittedSteerText = steerRaw;
+      let fittedToolText = toolText;
+      if (toolBytes <= half) {
+        fittedSteerText = fitBridgeToolOutput(steerRaw, {
+          readable: this.#readable,
+          directory: this.#archiveDirectory,
+          maxBytes: avail - toolBytes,
+        });
+      } else if (steerBytes <= half) {
+        fittedToolText = fitBridgeToolOutput(toolText, {
+          readable: this.#readable,
+          directory: this.#archiveDirectory,
+          maxBytes: avail - steerBytes,
+        });
+      } else {
+        fittedSteerText = fitBridgeToolOutput(steerRaw, {
+          readable: this.#readable,
+          directory: this.#archiveDirectory,
+          maxBytes: half,
+        });
+        fittedToolText = fitBridgeToolOutput(toolText, {
+          readable: this.#readable,
+          directory: this.#archiveDirectory,
+          maxBytes: avail - Buffer.byteLength(fittedSteerText, "utf8"),
+        });
+      }
+      return [{ type: "text", text: fittedSteerText }, { type: "text", text: fittedToolText }, ...imageParts];
+    }
+    return [
+      {
+        type: "text",
+        text: fitBridgeToolOutput(joinedText, {
+          readable: this.#readable,
+          directory: this.#archiveDirectory,
+          maxBytes,
+        }),
+      },
+      ...imageParts,
+    ];
   }
 
   /**

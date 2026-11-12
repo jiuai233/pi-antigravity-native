@@ -9,8 +9,9 @@
  * what it commits afterwards.
  */
 
+import { createHash } from "node:crypto";
 import { type AgyChildrenHost, killOwnedAgyTrees } from "../driver/agy-children.ts";
-import { AgySpawnError, AgyStallError, type AgyTurnDiagnostic, type AgyTurnRequest } from "../driver/agy-client.ts";
+import { AgySpawnError, AgyStallError, type AgyTurnDiagnostic, type AgyTurnRequest, notifyAgyDiagnostic } from "../driver/agy-client.ts";
 import {
   type AgyExecutorSnapshot,
   type AgyRecycleCause,
@@ -20,6 +21,7 @@ import {
 import type { AgyExecutionMode } from "../driver/agy-profile.ts";
 import type { AgyTurnOutcome, AgyUsage } from "../driver/reducer.ts";
 import { stallContinuationPrompt } from "../input/prompt.ts";
+import { captureMaxNativeStep, countNativeUserSteps, hasUnfinishedPersistedTurn } from "../native/native-terminal.ts";
 import { NativeThinkingObserver } from "../native/native-thinking.ts";
 import { AgyTurnController } from "./turn.ts";
 import { AgyTurnBudget } from "./turn-budget.ts";
@@ -104,6 +106,12 @@ export interface StreamTurnRequest {
   /** Effective native profile and actual bridged schemas, not instance paths. */
   readonly nativeContractHash?: string;
   readonly nativeTools?: string[];
+  /** Rendered custom-agent markdown body used to patch persisted AgentConfig in-place. */
+  readonly agentBody?: string;
+  /** Earlier chunks of active pi-branch history prefilled before the final restored turn. */
+  readonly historyPrefill?: readonly string[];
+  /** Effort resolved for historyPrefill ACK turns (typically "low" when supported). */
+  readonly prefillEffort?: "low" | "medium" | "high";
   /** Active pi-branch history used only when a fresh agy conversation needs restoring. */
   readonly historyBootstrap?: string;
   /** Native input when it differs from the loop identity: steer text sent as a follow-up turn. */
@@ -133,14 +141,24 @@ export type AgyTurnRunner = (request: AgyTurnRequest) => Promise<AgyTurnOutcome>
 interface TurnContext {
   readonly controller: AgyTurnController;
   readonly request: StreamTurnRequest;
+  readonly agentRevision: string | undefined;
   readonly generation: number;
   readonly abort: AbortController;
   readonly budget: AgyTurnBudget;
   readonly timeoutError: AgySpawnError;
   readonly resumingPersisted: boolean;
   readonly bridgeBootstrap: string | undefined;
+  readonly freshRestorePrefill: readonly string[];
   readonly freshRestorePrompt: string;
   readonly thinking: NativeThinkingObserver;
+  hadRestorePending: boolean;
+  priorSystemPromptHash: string | undefined;
+  priorNativeContractHash: string | undefined;
+  startedFreshConversation: boolean;
+  prefillCompleted: boolean;
+  realTurnBaselineSteps: number;
+  preTurnMaxStep: number | null;
+  migrationFailed: boolean;
   restoredAttemptActive: boolean;
   restoredResultMissing: boolean;
   attemptNumber: number;
@@ -170,6 +188,8 @@ export class AntigravityRuntime {
   #restoredConversationPending = false;
   #lastSystemPromptHash: string | undefined;
   #lastNativeContractHash: string | undefined;
+  /** One-shot marker when a turn failed after persisting USER_INPUT without finishing. */
+  #pendingRetryContinuation: { conversationId: string; prompt: string; beforeStep: number } | undefined;
 
   // The active turn. Every superseded turn bumps the generation; late
   // callbacks and commits from older generations are discarded.
@@ -185,6 +205,7 @@ export class AntigravityRuntime {
   #activeAbort: AbortController | undefined;
   #activeBudget: AgyTurnBudget | undefined;
   #activeThinking: NativeThinkingObserver | undefined;
+  #activePrefilling = false;
 
   readonly #childrenHost: AgyChildrenHost | undefined;
 
@@ -218,6 +239,7 @@ export class AntigravityRuntime {
   async restoreConversation(state: RestoredAntigravityConversation): Promise<void> {
     this.#ensureOpen();
     await this.#recycle("recycle", "restore");
+    this.#pendingRetryContinuation = undefined;
     this.#conversationId = state.conversationId;
     this.#conversationUsage = { ...state.usage };
     this.#conversationCwd = state.cwd;
@@ -283,7 +305,7 @@ export class AntigravityRuntime {
    * (the bridge then fails the MCP call closed).
    */
   pushBridgeCall(call: BridgeCallRequest): boolean {
-    if (this.#closed || !this.#active || this.#active.isClosed()) return false;
+    if (this.#closed || !this.#active || this.#active.isClosed() || this.#activePrefilling) return false;
     this.#activeThinking?.flush();
     this.#active.beginNativeThinkingBridge(call.id, call.nativeServerName, call.nativeToolName);
     this.#activeBudget?.pause(call.id);
@@ -298,6 +320,7 @@ export class AntigravityRuntime {
 
   async abortTurn(): Promise<void> {
     this.#ensureOpen();
+    this.#pendingRetryContinuation = undefined;
     await this.#recycle("abort");
   }
 
@@ -326,6 +349,7 @@ export class AntigravityRuntime {
   async close(): Promise<void> {
     this.#ensureOpen();
     this.#closed = true;
+    this.#pendingRetryContinuation = undefined;
     this.#conversationId = undefined;
     this.#conversationUsage = {};
     this.#conversationCwd = undefined;
@@ -345,6 +369,7 @@ export class AntigravityRuntime {
   }
 
   #forgetConversation(restoreHistory: boolean): void {
+    this.#pendingRetryContinuation = undefined;
     this.#conversationId = undefined;
     this.#conversationUsage = {};
     this.#conversationCwd = undefined;
@@ -366,8 +391,12 @@ export class AntigravityRuntime {
       if (this.#conversationId) dropped = true;
       this.#forgetConversation(true);
     }
+    // When prepareAgent supplies agentBody, upgradeNativeConversationDb patches
+    // persisted AgentConfig PromptSections + ToolFilters in-place on driver
+    // recycle, so prompt/contract changes keep the native conversation alive.
     if (
       this.#conversationId &&
+      request.agentBody === undefined &&
       (request.systemPromptHash !== this.#lastSystemPromptHash ||
         request.nativeContractHash !== this.#lastNativeContractHash)
     ) {
@@ -383,6 +412,7 @@ export class AntigravityRuntime {
   #invalidateActiveTurn(): void {
     this.#activeThinking?.close();
     this.#activeThinking = undefined;
+    this.#activePrefilling = false;
     this.#generation += 1;
     this.#activeAbort?.abort();
     this.#activeAbort = undefined;
@@ -395,6 +425,10 @@ export class AntigravityRuntime {
   }
 
   async #recycle(reason: "recycle" | "abort" | "shutdown" = "recycle", cause?: AgyRecycleCause): Promise<void> {
+    const state = this.#executor.snapshot().state;
+    if (state === "starting" || state === "ready" || state === "running") {
+      notifyAgyDiagnostic(this.#onDiagnostic, { phase: "driver_recycle", atMs: Date.now(), conversationId: this.#conversationId, message: cause ?? reason });
+    }
     this.#invalidateActiveTurn();
     await this.#executor.close(reason, cause);
   }
@@ -461,11 +495,34 @@ export class AntigravityRuntime {
         request.signal.addEventListener("abort", requestAbortHandler, { once: true });
       }
     }
+    const startedFreshConversation = this.#conversationId === undefined;
+    const pendingRetry = this.#pendingRetryContinuation;
+    this.#pendingRetryContinuation = undefined;
+    const useRetryContinuation =
+      !droppedConversation &&
+      !startedFreshConversation &&
+      request.nativeInput === undefined &&
+      pendingRetry !== undefined &&
+      this.#conversationId === pendingRetry.conversationId &&
+      request.prompt === pendingRetry.prompt &&
+      hasUnfinishedPersistedTurn(pendingRetry.conversationId, pendingRetry.beforeStep, this.#cwd);
     const resumingPersisted = this.#restoredConversationPending && this.#conversationId !== undefined;
     const bridgeBootstrap = resumingPersisted ? request.bridgeBootstrap : undefined;
-    const historyBootstrap =
-      !this.#conversationId && this.#restoreHistoryOnNextConversation ? request.historyBootstrap : undefined;
-    const timeoutMs = envInt("AGY_TURN_TIMEOUT_MS", 600_000);
+    const shouldRestoreFresh = startedFreshConversation && this.#restoreHistoryOnNextConversation;
+    const initialPrefill = shouldRestoreFresh ? (request.historyPrefill ?? []) : [];
+    const historyBootstrap = shouldRestoreFresh ? request.historyBootstrap : undefined;
+    const preTurnMaxStep = initialPrefill.length === 0
+      ? captureMaxNativeStep(this.#conversationId, this.#cwd)
+      : null;
+    const agentRevision =
+      request.agentBody !== undefined
+        ? createHash("sha256")
+            .update(request.agentBody)
+            .update("\0")
+            .update(request.nativeContractHash ?? "")
+            .digest("hex")
+        : undefined;
+    const timeoutMs = envInt("AGY_TURN_TIMEOUT_MS", 0);
     const timeoutError = new AgySpawnError(
       `agy logical turn timed out after ${Math.round(timeoutMs / 1000)}s without a completed tool step`,
       "",
@@ -484,21 +541,31 @@ export class AntigravityRuntime {
     turn = {
       controller,
       request,
+      agentRevision,
       generation,
       abort,
       budget,
       timeoutError,
       resumingPersisted,
       bridgeBootstrap,
+      freshRestorePrefill: request.historyPrefill ?? [],
       freshRestorePrompt: joinPrompt([request.historyBootstrap, request.nativeInput ?? request.prompt]),
       thinking,
+      hadRestorePending: this.#restoreHistoryOnNextConversation,
+      priorSystemPromptHash: this.#lastSystemPromptHash,
+      priorNativeContractHash: this.#lastNativeContractHash,
+      startedFreshConversation,
+      prefillCompleted: initialPrefill.length === 0,
+      realTurnBaselineSteps: 0,
+      preTurnMaxStep,
+      migrationFailed: false,
       restoredAttemptActive: resumingPersisted,
       restoredResultMissing: false,
       attemptNumber: 0,
       attemptStartedAtMs: Date.now(),
     };
     this.#activeThinking = thinking;
-    thinking.prepare(this.#conversationId);
+    if (initialPrefill.length === 0) thinking.prepare(this.#conversationId);
     let onTurnAbort!: () => void;
     const cancelled = new Promise<never>((_resolve, reject) => {
       onTurnAbort = () => {
@@ -510,20 +577,35 @@ export class AntigravityRuntime {
     });
     // Keep the controller's user-prompt identity unchanged on Pi tool-loop
     // re-entry; rebind only at the native request boundary.
+    const effectiveTurnInput = useRetryContinuation
+      ? stallContinuationPrompt()
+      : (request.nativeInput ?? request.prompt);
+    if (useRetryContinuation) {
+      this.#report(turn, {
+        phase: "retry_continuation",
+        atMs: Date.now(),
+        conversationId: this.#conversationId,
+        message: "Replaced duplicate retry prompt with continuation prompt.",
+      });
+    }
     const spawnRequest = this.#spawnRequest(
       turn,
-      joinPrompt([historyBootstrap, bridgeBootstrap, request.nativeInput ?? request.prompt]),
+      joinPrompt([historyBootstrap, bridgeBootstrap, effectiveTurnInput]),
       timeoutMs,
     );
     // A non-cooperative executor/preflight cannot hold the provider open past
     // cancellation; its late callbacks are fenced by generation. race attaches
     // rejection handlers to both inputs, including the loser.
-    this.#activeCompletion = Promise.race([this.#runWithRetries(turn, spawnRequest), cancelled])
+    this.#activeCompletion = Promise.race([
+      this.#executeTurn(turn, initialPrefill, spawnRequest, timeoutMs),
+      cancelled,
+    ])
       .then((outcome: AgyTurnOutcome) => this.#commit(turn, outcome))
       .catch((cause: unknown) => this.#failTurn(turn, cause))
       .finally(() => {
         thinking.close();
         if (this.#activeThinking === thinking) this.#activeThinking = undefined;
+        if (this.#isCurrent(turn)) this.#activePrefilling = false;
         budget.dispose();
         if (this.#activeBudget === budget) this.#activeBudget = undefined;
         abort.signal.removeEventListener("abort", onTurnAbort);
@@ -531,6 +613,159 @@ export class AntigravityRuntime {
         if (this.#activeAbort === abort) this.#activeAbort = undefined;
       });
     return controller;
+  }
+
+  async #executeTurn(
+    turn: TurnContext,
+    initialPrefill: readonly string[],
+    spawnRequest: AgyTurnRequest,
+    timeoutMs: number,
+  ): Promise<AgyTurnOutcome> {
+    if (initialPrefill.length > 0) {
+      await this.#runPrefillChunks(turn, initialPrefill, timeoutMs);
+      turn.realTurnBaselineSteps = this.#conversationId
+        ? (countNativeUserSteps(this.#conversationId, this.#cwd) ?? 0)
+        : 0;
+      turn.preTurnMaxStep = captureMaxNativeStep(this.#conversationId, this.#cwd);
+      turn.prefillCompleted = true;
+      turn.thinking.prepare(this.#conversationId);
+      spawnRequest = { ...spawnRequest, conversationId: this.#conversationId };
+    }
+    return this.#runWithRetries(turn, spawnRequest, timeoutMs);
+  }
+
+  async #runPrefillChunks(turn: TurnContext, chunks: readonly string[], timeoutMs: number): Promise<void> {
+    this.#activePrefilling = true;
+    try {
+      for (const chunkPrompt of chunks) {
+        const chunkBaselineSteps = this.#conversationId
+          ? (countNativeUserSteps(this.#conversationId, this.#cwd) ?? 0)
+          : 0;
+        const stepRequest = this.#prefillSpawnRequest(turn, chunkPrompt, timeoutMs);
+        const outcome = await this.#runPrefillStepWithRetries(turn, stepRequest, chunkBaselineSteps);
+        if (outcome.status === "ERROR") {
+          throw new AgySpawnError(outcome.error || "agy history prefill turn failed.", "");
+        }
+        if (outcome.conversationId) {
+          this.#conversationId = outcome.conversationId;
+          this.#conversationCwd = this.#cwd;
+        }
+        if (outcome.usage) {
+          this.#conversationUsage = { ...outcome.usage };
+          turn.controller.resetConversationUsage(this.#conversationUsage);
+        }
+        turn.budget.renew();
+      }
+    } finally {
+      if (this.#isCurrent(turn)) this.#activePrefilling = false;
+    }
+  }
+
+  #prefillSpawnRequest(turn: TurnContext, prompt: string, timeoutMs: number): AgyTurnRequest {
+    const { request } = turn;
+    return {
+      prompt,
+      conversationId: this.#conversationId,
+      model: request.modelId,
+      effort: request.prefillEffort ?? request.effort,
+      agent: request.agent,
+      ...(request.agentBody !== undefined ? { agentBody: request.agentBody } : {}),
+      ...(turn.agentRevision !== undefined ? { agentRevision: turn.agentRevision } : {}),
+      mode: request.mode,
+      mcpDirectory: request.mcpDirectory,
+      bridgeRevision: request.bridgeRevision,
+      nativeTools: request.nativeTools,
+      cwd: this.#cwd,
+      timeoutMs,
+      budget: turn.budget,
+      childOwner: this.#childOwner,
+      inactivityTimeoutMs: envInt("AGY_STALL_TIMEOUT_MS", 300_000),
+      toolInactivityTimeoutMs: envInt("AGY_TOOL_STALL_TIMEOUT_MS", 600_000),
+      signal: turn.abort.signal,
+      onConversation: (id) => {
+        if (!this.#isCurrent(turn) || turn.abort.signal.aborted) return;
+        this.#restoreHistoryOnNextConversation = false;
+        this.#conversationId = id;
+        this.#conversationCwd = this.#cwd;
+        if (!turn.migrationFailed) {
+          this.#lastSystemPromptHash = request.systemPromptHash;
+          this.#lastNativeContractHash = request.nativeContractHash;
+        }
+        turn.controller.bindNativeConversation(id);
+      },
+      onDiagnostic: (event) => this.#report(turn, event),
+      onActivity: (activity) => {
+        if (!this.#isCurrent(turn) || turn.abort.signal.aborted) return;
+        if (activity.type === "tool_done" || activity.type === "tool_error") turn.budget.renew();
+        if (activity.type === "native_migration_warning") {
+          turn.migrationFailed = true;
+          turn.controller.push(activity);
+        }
+      },
+    };
+  }
+
+  async #runPrefillStepWithRetries(
+    turn: TurnContext,
+    stepRequest: AgyTurnRequest,
+    chunkBaselineSteps: number,
+  ): Promise<AgyTurnOutcome> {
+    const { controller, budget, abort } = turn;
+    let retry = 0;
+    for (;;) {
+      if (abort.signal.aborted) throw this.#abortFailure(turn);
+      const remainingMs = budget.remainingMs();
+      if (remainingMs <= 0) throw turn.timeoutError;
+      const resumableConversationId = this.#conversationId ?? stepRequest.conversationId;
+      const resumingRetry = retry > 0 && resumableConversationId !== undefined;
+      let retryPrompt = stepRequest.prompt;
+      if (resumingRetry) {
+        const persisted = countNativeUserSteps(resumableConversationId, this.#cwd);
+        const chunkPersisted = persisted !== null && persisted > chunkBaselineSteps;
+        if (chunkPersisted) {
+          retryPrompt =
+            "The stream was interrupted before your previous turn completed. Do not call any tools; reply with `ACK` only.";
+        }
+      }
+      const attempt: AgyTurnRequest = {
+        ...stepRequest,
+        prompt: retryPrompt,
+        conversationId: resumableConversationId,
+        timeoutMs: Number.isFinite(remainingMs) ? remainingMs : 0,
+        inactivityTimeoutMs:
+          resumingRetry && stepRequest.inactivityTimeoutMs !== 0
+            ? Math.max(stepRequest.inactivityTimeoutMs ?? 300_000, stepRequest.toolInactivityTimeoutMs ?? 600_000)
+            : stepRequest.inactivityTimeoutMs,
+      };
+      turn.attemptNumber += 1;
+      turn.attemptStartedAtMs = Date.now();
+      this.#report(turn, { phase: "attempt_start", atMs: turn.attemptStartedAtMs, waitLimitMs: attempt.inactivityTimeoutMs });
+      try {
+        const outcome = await this.#executor.run(attempt);
+        if (abort.signal.aborted) throw this.#abortFailure(turn);
+        return outcome;
+      } catch (error) {
+        if (abort.signal.aborted) throw this.#abortFailure(turn);
+        if (!(error instanceof AgyStallError) || retry >= STALL_MAX_RETRIES) throw error;
+        retry += 1;
+        this.#report(turn, {
+          phase: "retry",
+          atMs: Date.now(),
+          attempt: turn.attemptNumber + 1,
+          elapsedMs: Date.now() - turn.attemptStartedAtMs,
+          message: error.message,
+        });
+        controller.push({
+          type: "stall",
+          retry,
+          maxRetries: STALL_MAX_RETRIES,
+          stalledMs: error.stalledMs,
+          toolActive: error.toolActive,
+        });
+        const backoffMs = envInt("AGY_STALL_RETRY_BACKOFF_MS", 3_000);
+        if (!(await waitForRetryBackoff(backoffMs, abort.signal))) throw this.#abortFailure(turn);
+      }
+    }
   }
 
   #spawnRequest(turn: TurnContext, prompt: string, timeoutMs: number): AgyTurnRequest {
@@ -541,6 +776,8 @@ export class AntigravityRuntime {
       model: request.modelId,
       effort: request.effort,
       agent: request.agent,
+      ...(request.agentBody !== undefined ? { agentBody: request.agentBody } : {}),
+      ...(turn.agentRevision !== undefined ? { agentRevision: turn.agentRevision } : {}),
       mode: request.mode,
       mcpDirectory: request.mcpDirectory,
       bridgeRevision: request.bridgeRevision,
@@ -549,8 +786,8 @@ export class AntigravityRuntime {
       timeoutMs,
       budget: turn.budget,
       childOwner: this.#childOwner,
-      inactivityTimeoutMs: envInt("AGY_STALL_TIMEOUT_MS", 120_000),
-      toolInactivityTimeoutMs: envInt("AGY_TOOL_STALL_TIMEOUT_MS", 300_000),
+      inactivityTimeoutMs: envInt("AGY_STALL_TIMEOUT_MS", 300_000),
+      toolInactivityTimeoutMs: envInt("AGY_TOOL_STALL_TIMEOUT_MS", 600_000),
       signal: turn.abort.signal,
       subscribeNativeProgress: listener => turn.controller.subscribeNativeProgress(listener),
       onConversation: (id) => {
@@ -560,8 +797,10 @@ export class AntigravityRuntime {
         // and /agy-tasks needs the id meanwhile.
         this.#conversationId = id;
         this.#conversationCwd = this.#cwd;
-        this.#lastSystemPromptHash = request.systemPromptHash;
-        this.#lastNativeContractHash = request.nativeContractHash;
+        if (!turn.migrationFailed) {
+          this.#lastSystemPromptHash = request.systemPromptHash;
+          this.#lastNativeContractHash = request.nativeContractHash;
+        }
         turn.controller.bindNativeConversation(id);
         turn.thinking.bind(id);
       },
@@ -569,6 +808,11 @@ export class AntigravityRuntime {
       onActivity: (activity) => {
         if (!this.#isCurrent(turn) || turn.abort.signal.aborted) return;
         if (activity.type === "tool_done" || activity.type === "tool_error") turn.budget.renew();
+        if (activity.type === "native_migration_warning") {
+          turn.migrationFailed = true;
+          this.#lastSystemPromptHash = turn.priorSystemPromptHash;
+          this.#lastNativeContractHash = turn.priorNativeContractHash;
+        }
         if (
           turn.restoredAttemptActive &&
           activity.type === "result" &&
@@ -605,18 +849,41 @@ export class AntigravityRuntime {
    * retries — spawn/auth failures would fail identically again. A restored
    * conversation that disappeared falls back once to a fresh bootstrap.
    */
-  async #runWithRetries(turn: TurnContext, spawnRequest: AgyTurnRequest): Promise<AgyTurnOutcome> {
+  async #runWithRetries(
+    turn: TurnContext,
+    spawnRequest: AgyTurnRequest,
+    timeoutMs: number,
+  ): Promise<AgyTurnOutcome> {
     const { controller, budget, abort } = turn;
     let retry = 0;
     let freshFallback = false;
-    const startFreshFallback = () => {
+    const startFreshFallback = async () => {
       turn.restoredAttemptActive = false;
+      turn.startedFreshConversation = true;
+      turn.hadRestorePending = true;
+      turn.priorSystemPromptHash = undefined;
+      turn.priorNativeContractHash = undefined;
+      turn.realTurnBaselineSteps = 0;
+      turn.preTurnMaxStep = -1;
+      turn.prefillCompleted = turn.freshRestorePrefill.length === 0;
+      turn.migrationFailed = false;
       controller.push({ type: "conversation_fallback" });
-      turn.thinking.prepare();
+      controller.resetConversationUsage({});
+      turn.thinking.close();
       this.#forgetConversation(true);
       this.#lastSystemPromptHash = undefined;
+      this.#lastNativeContractHash = undefined;
       freshFallback = true;
       retry = 0;
+      if (turn.freshRestorePrefill.length > 0) {
+        await this.#runPrefillChunks(turn, turn.freshRestorePrefill, timeoutMs);
+        turn.realTurnBaselineSteps = this.#conversationId
+          ? (countNativeUserSteps(this.#conversationId, this.#cwd) ?? 0)
+          : 0;
+        turn.preTurnMaxStep = captureMaxNativeStep(this.#conversationId, this.#cwd);
+        turn.prefillCompleted = true;
+      }
+      turn.thinking.prepare(this.#conversationId);
     };
     for (;;) {
       if (abort.signal.aborted) throw this.#abortFailure(turn);
@@ -636,12 +903,12 @@ export class AntigravityRuntime {
             ? turn.freshRestorePrompt
             : spawnRequest.prompt,
         conversationId: resumableConversationId,
-        timeoutMs: remainingMs,
+        timeoutMs: Number.isFinite(remainingMs) ? remainingMs : 0,
         // Only known-conversation recovery gets the tool-sized silence
         // allowance; the ordinary stream watchdog stays unchanged.
         inactivityTimeoutMs:
           resumingRetry && spawnRequest.inactivityTimeoutMs !== 0
-            ? Math.max(spawnRequest.inactivityTimeoutMs ?? 120_000, spawnRequest.toolInactivityTimeoutMs ?? 300_000)
+            ? Math.max(spawnRequest.inactivityTimeoutMs ?? 300_000, spawnRequest.toolInactivityTimeoutMs ?? 600_000)
             : spawnRequest.inactivityTimeoutMs,
         onConversation: spawnRequest.onConversation,
       };
@@ -654,14 +921,14 @@ export class AntigravityRuntime {
         // while processing a delayed fallback result.
         if (abort.signal.aborted) throw this.#abortFailure(turn);
         if (turn.resumingPersisted && !freshFallback && turn.restoredResultMissing) {
-          startFreshFallback();
+          await startFreshFallback();
           continue;
         }
         return outcome;
       } catch (error) {
         if (abort.signal.aborted) throw this.#abortFailure(turn);
         if (turn.resumingPersisted && !freshFallback && isMissingConversationFailure(error)) {
-          startFreshFallback();
+          await startFreshFallback();
           continue;
         }
         if (!(error instanceof AgyStallError) || retry >= STALL_MAX_RETRIES) throw error;
@@ -698,16 +965,49 @@ export class AntigravityRuntime {
       elapsedMs: Date.now() - turn.attemptStartedAtMs,
       message: outcome.error,
     });
+    if (
+      outcome.status === "ERROR" &&
+      turn.startedFreshConversation &&
+      !this.#isFreshRealTurnPersisted(turn, outcome.conversationId ?? this.#conversationId)
+    ) {
+      this.#rollbackUnpersistedFreshTurn(turn);
+      turn.controller.close();
+      return;
+    }
+    if (outcome.status === "ERROR" && !turn.abort.signal.aborted) {
+      const candidateId = outcome.conversationId ?? this.#conversationId;
+      if (candidateId && turn.preTurnMaxStep !== null && hasUnfinishedPersistedTurn(candidateId, turn.preTurnMaxStep, this.#cwd)) {
+        this.#pendingRetryContinuation = {
+          conversationId: candidateId,
+          prompt: turn.request.prompt,
+          beforeStep: turn.preTurnMaxStep,
+        };
+      }
+    }
     this.#turns += 1;
     if (outcome.conversationId) {
       this.#conversationId = outcome.conversationId;
       this.#restoreHistoryOnNextConversation = false;
-      this.#lastSystemPromptHash = turn.request.systemPromptHash;
-      this.#lastNativeContractHash = turn.request.nativeContractHash;
+      if (!turn.migrationFailed) {
+        this.#lastSystemPromptHash = turn.request.systemPromptHash;
+        this.#lastNativeContractHash = turn.request.nativeContractHash;
+      }
     }
     if (outcome.usage) this.#conversationUsage = { ...outcome.usage };
     this.#restoredConversationPending = false;
     turn.controller.close();
+  }
+
+  #isFreshRealTurnPersisted(turn: TurnContext, candidateId: string | undefined): boolean {
+    if (!turn.prefillCompleted || !candidateId) return false;
+    const persistedSteps = countNativeUserSteps(candidateId, this.#cwd);
+    return persistedSteps !== null && persistedSteps > turn.realTurnBaselineSteps;
+  }
+
+  #rollbackUnpersistedFreshTurn(turn: TurnContext): void {
+    this.#forgetConversation(turn.hadRestorePending);
+    this.#lastSystemPromptHash = turn.priorSystemPromptHash;
+    this.#lastNativeContractHash = turn.priorNativeContractHash;
   }
 
   #failTurn(turn: TurnContext, cause: unknown): void {
@@ -716,6 +1016,17 @@ export class AntigravityRuntime {
     if (!this.#isCurrent(turn)) {
       turn.controller.close();
       return;
+    }
+    if (turn.startedFreshConversation && !this.#isFreshRealTurnPersisted(turn, this.#conversationId)) {
+      this.#rollbackUnpersistedFreshTurn(turn);
+    } else if (!turn.abort.signal.aborted && this.#conversationId && turn.preTurnMaxStep !== null) {
+      if (hasUnfinishedPersistedTurn(this.#conversationId, turn.preTurnMaxStep, this.#cwd)) {
+        this.#pendingRetryContinuation = {
+          conversationId: this.#conversationId,
+          prompt: turn.request.prompt,
+          beforeStep: turn.preTurnMaxStep,
+        };
+      }
     }
     this.#report(turn, {
       phase: "attempt_end",
@@ -737,7 +1048,7 @@ export class AntigravityRuntime {
 
   #report(turn: TurnContext, event: AgyTurnDiagnostic): void {
     if (!this.#isCurrent(turn)) return;
-    this.#onDiagnostic?.({
+    notifyAgyDiagnostic(this.#onDiagnostic, {
       ...event,
       attempt: event.attempt ?? turn.attemptNumber,
       conversationId: event.conversationId ?? this.#conversationId,

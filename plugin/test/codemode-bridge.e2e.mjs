@@ -16,6 +16,7 @@ import { AgyReplayStore } from '../src/provider/replay.ts';
 import { latestUserPrompt } from '../src/input/pi-input.ts';
 import { fixture } from './offline-fixture.mjs';
 import { ToolProjection } from '../src/extension/tool-projection.ts';
+import { AgyPrefixAudit, PREFIX_AUDIT_ENTRY } from '../src/native/prefix-audit.ts';
 
 const sdkRoot = process.env.PI_STACK_PI_ROOT;
 assert.ok(sdkRoot, 'PI_STACK_PI_ROOT must select the installed SDK');
@@ -47,10 +48,13 @@ for (const mode of ['on', 'only']) {
     const settingsManager = SettingsManager.inMemory({ codemode: { mode, inlineBudget: mode === 'only' ? 0 : 3000 },
       retry: { enabled: false }, compaction: { enabled: false } });
     const hooks = [];
+    let persistAudit;
+    const audit = new AgyPrefixAudit(event => persistAudit(event));
     const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager,
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
       agentsFilesOverride: () => ({ agentsFiles: [] }),
       extensionFactories: [createCodemodeExtension({ models: false }), pi => {
+        persistAudit = event => pi.appendEntry(PREFIX_AUDIT_ENTRY, event);
         pi.registerTool({ name: 'enable_fixture', label: 'Enable fixture', description: 'Enable the late fixture tool.',
           parameters: Type.Object({}), defaultActive: false,
           async execute() { pi.setActiveTools([...pi.getActiveTools(), 'late_fixture']); return { content: [{ type: 'text', text: 'enabled' }], details: {} }; } });
@@ -130,10 +134,18 @@ for (const mode of ['on', 'only']) {
         isActiveTool: name => session.getActiveToolNames().includes(name),
         prepareAgent: async (prompt, tools) => {
           captures.push(tools.map(tool => ({ name: tool.name, description: tool.description })));
-          return projection.prepare(workspace, prompt, tools);
+          const prepared = projection.prepare(workspace, prompt, tools);
+          const before = JSON.stringify(session.agent.state.messages);
+          audit.recordLocal(prompt, tools, prepared);
+          assert.equal(JSON.stringify(session.agent.state.messages), before, 'audit journal must not enter model context');
+          assert.equal(workspace.agentBody, prepared.agentBody, 'audit must not rewrite the agent');
+          return prepared;
         } });
       session.agent.streamFunction = provider;
       await session.prompt('Read the two fixtures and use the newly enabled tool in this same task.');
+      const entries = fs.readFileSync(session.sessionFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      assert.ok(entries.some(entry => entry.type === 'custom' && entry.customType === PREFIX_AUDIT_ENTRY));
+      assert.doesNotMatch(JSON.stringify(session.agent.state.messages), /pi-antigravity-prefix-audit/);
       assert.equal(nativeRequests, 1);
       assert.equal(bridgeCalls, 2); // One read batch, then one dynamic-discovery verification.
       assert.equal(hooks.filter(name => name === 'read').length, 2);
@@ -146,7 +158,8 @@ for (const mode of ['on', 'only']) {
         nativeExecutorRequests: nativeRequests, readBatchBridgeCalls: 1, dynamicDiscoveryBridgeCalls: 1,
         readExecutions: hooks.filter(name => name === 'read').length, lateToolExecutions: 1,
         declaredToolsByRequest: captures.map(tools => tools.map(tool => tool.name)), sessionFile: session.sessionFile,
-        realAgyProcesses: 0, externalModelCalls: 0 };
+        auditJournalEntries: entries.filter(entry => entry.type === 'custom' && entry.customType === PREFIX_AUDIT_ENTRY).length,
+        auditInModelContext: false, realAgyProcesses: 0, externalModelCalls: 0 };
       fs.writeFileSync(path.join(root, 'summary.json'), JSON.stringify(summary, null, 2) + '\n');
       t.diagnostic(JSON.stringify(summary));
     } finally {
